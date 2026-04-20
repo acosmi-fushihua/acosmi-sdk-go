@@ -25,7 +25,7 @@ import (
 
 func main() {
     client, _ := acosmi.NewClient(acosmi.Config{
-        ServerURL: "https://acosmi.ai", // 生产环境; 本地开发用 http://127.0.0.1:3300
+        ServerURL: "https://acosmi.com", // 默认大陆站 (零值也是此值); 国际站传 https://acosmi.ai; 本地开发 http://127.0.0.1:3300
     })
 
     ctx := context.Background()
