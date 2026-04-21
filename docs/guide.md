@@ -1,6 +1,6 @@
 # Acosmi Go SDK 开发手册
 
-> v0.5.0 | Go 1.22+ | MIT
+> v0.9.0 | Go 1.22+ | MIT
 
 ## 目录
 
@@ -16,6 +16,9 @@
   - [4.6 钱包](#46-钱包)
   - [4.7 技能商店](#47-技能商店)
   - [4.8 WebSocket 实时推送](#48-websocket-实时推送)
+  - [4.9 通知管理](#49-通知管理)
+  - [4.10 设备注册 (推送通知)](#410-设备注册-推送通知)
+  - [4.11 通知偏好](#411-通知偏好)
 - [5. CLI 命令手册](#5-cli-命令手册)
 - [6. 数据类型参考](#6-数据类型参考)
 - [7. 完整示例](#7-完整示例)
@@ -40,9 +43,10 @@ Acosmi Go SDK 提供两种使用方式:
 | 统一客户端 | 一个 `Client` 覆盖全域 API |
 | 流式聊天 | SSE 实时对话 + 结算余额推送 |
 | 多厂商 Adapter | per-provider 路由: Anthropic 格式 / OpenAI 兼容格式自动切换 |
-| Beta 自动组装 | 根据模型能力自动注入 11 项 beta header (仅 Anthropic 格式) |
+| Beta 自动组装 | 根据模型能力自动注入 10 项 beta header (仅 Anthropic 格式) |
 | Server Tool | 联网搜索等服务端工具自动合入请求体 (仅 Anthropic 格式) |
-| 模型能力矩阵 | 17 项能力标记，驱动 UI 功能开关 |
+| 模型能力矩阵 | 18 项能力标记，驱动 UI 功能开关 |
+| 思考级别 API | v0.9.0 三档 `off`/`high`/`max`，自动组装 thinking+effort+maxTokens |
 | WebSocket | 实时余额/技能/系统推送，自动断线重连 |
 | 线程安全 | `sync.RWMutex` 保护所有共享状态 |
 
@@ -50,10 +54,11 @@ Acosmi Go SDK 提供两种使用方式:
 
 | 环境 | 地址 |
 |------|------|
-| **生产** | `https://acosmi.ai` (默认，零配置) |
+| **默认 (大陆站)** | `https://acosmi.com` (零配置) |
+| 国际站 | `https://acosmi.ai` (显式传入 `ServerURL`) |
 | 本地开发 | `http://127.0.0.1:3300` |
 
-SDK 自动追加 `/api/v4`，无需手动拼接。
+SDK 自动追加 `/api/v4`，无需手动拼接。`acosmi.com` 与 `acosmi.ai` 端点完全兼容，按业务区域选择即可。
 
 **切换环境** (优先级从高到低):
 ```bash
@@ -153,7 +158,7 @@ type TokenStore interface {
 
 ```go
 client, err := acosmi.NewClient(acosmi.Config{
-    ServerURL:  "https://acosmi.ai", // SDK 自动追加 /api/v4
+    ServerURL:  "",                   // 零值 → https://acosmi.com (默认); 国际站传 https://acosmi.ai
     Store:      nil,                  // 默认 ~/.acosmi/tokens.json
     HTTPClient: nil,                  // 默认无全局超时 (避免截断 SSE 流)
 })
@@ -224,15 +229,23 @@ caps, _ := client.GetModelCapabilities(ctx, "claude-opus-4-6")
 
 #### 同步聊天
 
+> **v0.4.1+ 重要变更**：`Chat()` 的返回结构 `ChatResponse` 已改为 Anthropic 风格的 Content Blocks（`Content []ChatContentBlock`），不论 provider 是 Anthropic 还是 OpenAI 兼容厂商都统一。
+
 ```go
 resp, _ := client.Chat(ctx, modelID, acosmi.ChatRequest{
+    System: "你是一个有帮助的助手",                 // 顶层字段 (Anthropic 约定), 不要塞到 Messages
     Messages: []acosmi.ChatMessage{
-        {Role: "system", Content: "你是一个有帮助的助手"},
         {Role: "user", Content: "Go 语言的优势？"},
     },
     MaxTokens: 1024,
 })
-fmt.Println(resp.Choices[0].Message.Content)
+
+// 遍历 content blocks 提取文本 (text / thinking / tool_use 混合出现)
+for _, b := range resp.Content {
+    if b.Type == "text" {
+        fmt.Print(b.Text)
+    }
+}
 
 // 结算余额 (来自 Header，-1 表示未返回)
 if resp.TokenRemaining >= 0 {
@@ -240,9 +253,17 @@ if resp.TokenRemaining >= 0 {
 }
 ```
 
+> 若需更便捷的文本提取助手方法 (`TextContent() / ThinkingContent() / ToolUseBlocks()`)，请使用 `ChatMessages()` 返回的 `*AnthropicResponse`（§Anthropic 原生格式小节）。
+
 #### 流式聊天 — ChatStreamWithUsage (推荐)
 
 返回 4 个 channel: 内容 / 搜索来源 / 结算 / 错误。
+
+> **SSE 格式随 provider 而异**：
+> - `ChatStream` / `ChatStreamWithUsage` 对 Anthropic provider 透传 Anthropic 原生 SSE（`content_block_delta` 等）；对 OpenAI 兼容 provider 透传 OpenAI SSE（`choices[].delta.content`）。
+> - `ChatMessagesStream` 统一输出 Anthropic SSE，对 OpenAI provider 会做格式转换（见 §Anthropic 原生格式）。
+>
+> 若不想感知差异，推荐用 `ChatMessagesStream` 或在调用前通过 `ListModels()` 缓存中读取 `model.Provider` 分支解析。
 
 ```go
 contentCh, sourcesCh, settleCh, errCh := client.ChatStreamWithUsage(ctx, modelID, acosmi.ChatRequest{
@@ -258,13 +279,27 @@ go func() {
     }
 }()
 
+// 解析示例 — 同时兼容 Anthropic 与 OpenAI 两种 SSE payload
 for event := range contentCh {
-    var chunk struct {
+    // 1) Anthropic 风格: {"type":"content_block_delta","delta":{"type":"text_delta","text":"..."}}
+    var ant struct {
+        Type  string `json:"type"`
+        Delta struct {
+            Type string `json:"type"`
+            Text string `json:"text"`
+        } `json:"delta"`
+    }
+    if json.Unmarshal([]byte(event.Data), &ant) == nil &&
+        ant.Type == "content_block_delta" && ant.Delta.Text != "" {
+        fmt.Print(ant.Delta.Text)
+        continue
+    }
+    // 2) OpenAI 风格: {"choices":[{"delta":{"content":"..."}}]}
+    var oai struct {
         Choices []struct{ Delta struct{ Content string `json:"content"` } `json:"delta"` } `json:"choices"`
     }
-    json.Unmarshal([]byte(event.Data), &chunk)
-    if len(chunk.Choices) > 0 {
-        fmt.Print(chunk.Choices[0].Delta.Content)
+    if json.Unmarshal([]byte(event.Data), &oai) == nil && len(oai.Choices) > 0 {
+        fmt.Print(oai.Choices[0].Delta.Content)
     }
 }
 
@@ -360,7 +395,7 @@ if err := <-errCh; err != nil {
 
 | Provider | Adapter | 端点后缀 | Betas 注入 | SSE 格式 |
 |----------|---------|----------|-----------|---------|
-| Anthropic | AnthropicAdapter | `/anthropic` | 是 (11 项) | Anthropic 原生 |
+| Anthropic | AnthropicAdapter | `/anthropic` | 是 (10 项) | Anthropic 原生 |
 | Acosmi | AnthropicAdapter | `/anthropic` | 是 | Anthropic 原生 |
 | DeepSeek | OpenAIAdapter | `/chat` | 否 | OpenAI → Anthropic 转换 |
 | DashScope (Qwen) | OpenAIAdapter | `/chat` | 否 | OpenAI → Anthropic 转换 |
@@ -421,10 +456,48 @@ eventCh, errCh := client.ChatStream(ctx, modelID, acosmi.ChatRequest{
 | `structured-outputs-2025-11-13` | 支持 + OutputConfig 非 nil |
 | `token-efficient-tools-2025-02-19` | 支持 + OutputConfig 为 nil (与上互斥) |
 | `advanced-tool-use-2025-11-20` | 支持 Tool Search |
-| `effort-2025-11-24` | 支持 + Effort 非 nil |
+| `effort-2025-11-24` | 支持 Effort 且 (`Effort 非 nil` 或 `Thinking.Level ∈ {high,max}`) |
 | `fast-mode-2026-02-01` | 支持 + Speed == "fast" |
 | `prompt-caching-scope-2026-01-05` | 支持 Prompt Cache |
 | `redact-thinking-2026-02-12` | 支持 + Thinking.Display == "summary" |
+
+#### 思考级别 (Thinking Level) — v0.9.0
+
+三档语义化入口，SDK 自动组装 `thinking` + `effort` + `max_tokens`，下游无需了解各字段联动细节：
+
+| 常量 | 含义 | thinking 字段 | effort | max_tokens |
+|------|------|---------------|--------|-----------|
+| `ThinkingOff` (`"off"`) | 关闭思考 | `{type:"disabled"}` | — (不发送) | 不改动 |
+| `ThinkingHigh` (`"high"`) | 标准思考 | `{type:"adaptive"}` (Claude 4.x) 或 `{type:"enabled", budget_tokens}` (旧模型) | `high` | 至少 32K (`ThinkingHighMinMaxTokens`) |
+| `ThinkingMax` (`"max"`) | 深度思考 | 同上 | `max` (若 `SupportsMaxEffort`) 否则 `high` | 拉到 `caps.MaxOutputTokens`，不可用时回退 128K (`ThinkingMaxFallbackMaxTokens`) |
+
+```go
+// 推荐写法 — 用 NewThinkingConfig 构造
+req := acosmi.ChatRequest{
+    Messages:  []acosmi.ChatMessage{{Role: "user", Content: "证明黎曼猜想"}},
+    MaxTokens: 8192,
+    Thinking:  acosmi.NewThinkingConfig(acosmi.ThinkingMax), // → adaptive + effort=max + maxTokens=modelMax
+}
+
+// 或直接填 Level 字段
+req.Thinking = &acosmi.ThinkingConfig{Type: "adaptive", Level: acosmi.ThinkingHigh}
+```
+
+**关键行为**:
+
+- **自动覆盖**：Level 非空时，SDK 接管 `thinking` / `effort` / `max_tokens` 的组装，不要再通过 `ExtraBody` 手动覆写这些 key，否则会与 SDK 计算结果冲突。
+- **temperature 互斥**：Level 非 `off` 时 SDK 自动删除 `temperature`（Anthropic API 约束）。
+- **旧模型回退**：不支持 `adaptive` 的模型回退 `enabled` + `budget_tokens = max_tokens - 1`。
+- **betaEffort 自动注入**：Level=`high`/`max` 且模型 `SupportsEffort` 时自动加入 `effort-2025-11-24` beta。
+- **v0.8.0 兼容模式**：`Level` 为空字符串时 SDK 保持 passthrough（`Thinking` / `Effort` 结构原样序列化），老代码零影响。
+
+```go
+// 配合模型能力开关 UI
+caps, _ := client.GetModelCapabilities(ctx, modelID)
+if caps.SupportsDeepThinking {
+    req.Thinking = acosmi.NewThinkingConfig(acosmi.ThinkingMax)
+}
+```
 
 ### 4.4 权益管理
 
@@ -637,7 +710,7 @@ crabclaw-skill [--server URL] [--json] <命令> [参数]
 
 ```bash
 crabclaw-skill config show                    # 查看
-crabclaw-skill config set server https://acosmi.ai  # 修改
+crabclaw-skill config set server https://acosmi.com # 修改 (默认; 国际站用 https://acosmi.ai)
 crabclaw-skill config set skilldir ~/my-skills
 crabclaw-skill config reset                   # 重置
 ```
@@ -648,7 +721,7 @@ crabclaw-skill config reset                   # 重置
 
 | 命令 | 说明 | 需登录 |
 |------|------|:------:|
-| `search <关键词> [--category --tag --page --page-size]` | 搜索技能 | 否 |
+| `search <关键词> [--category --tag --source --page --page-size]` | 搜索技能 | 否 |
 | `list` | 已安装技能 | 是 |
 | `info <key>` | 技能详情 | 否 |
 | `download <key> [-o 路径]` | 下载 ZIP (匿名 2次/时) | 否 |
@@ -698,11 +771,18 @@ type ManagedModel struct {
 }
 
 type ModelCapabilities struct {
+    // 思考能力
     SupportsThinking, SupportsAdaptiveThinking, SupportsISP       bool
+    // 工具与搜索
     SupportsWebSearch, SupportsToolSearch, SupportsStructuredOutput bool
+    // 推理控制
     SupportsEffort, SupportsMaxEffort, SupportsFastMode            bool
+    SupportsAutoMode, SupportsDeepThinking                         bool // v0.9.0: 深度思考 (Opus 4.6)
+    // 上下文与缓存
     Supports1MContext, SupportsPromptCache, SupportsCacheEditing   bool
-    SupportsTokenEfficient, SupportsRedactThinking, SupportsAutoMode bool
+    // 输出控制
+    SupportsTokenEfficient, SupportsRedactThinking                 bool
+    // Token 上限
     MaxInputTokens, MaxOutputTokens int
 }
 ```
@@ -736,13 +816,43 @@ type ChatRequest struct {
     ExtraBody    map[string]interface{} // 透传任意字段
 }
 
-type ChatResponse struct {       // /chat (OpenAI 格式)
-    ID      string
-    Object  string              // "chat.completion"
-    Choices []struct{ Index int; Message ChatMessage }
-    Usage   struct{ PromptTokens, CompletionTokens, TotalTokens int }
-    TokenRemaining int64 // Header 填充, -1=未返回
-    CallRemaining  int
+// v0.4.1+ ChatResponse 统一为 Anthropic content block 格式
+// (OpenAI 兼容厂商由 OpenAIAdapter 在响应侧转换，消费方无需区分)
+type ChatResponse struct {
+    ID         string             // Anthropic message ID
+    Type       string             // "message"
+    Model      string
+    Role       string             // "assistant"
+    Content    []ChatContentBlock // text / thinking / tool_use 等混合块
+    StopReason string             // end_turn / tool_use / max_tokens
+    Usage      ChatUsage          // 输入/输出 token + prompt cache 用量
+    TokenRemaining int64 // Header X-Token-Remaining 填充，-1=未返回
+    CallRemaining  int   // Header X-Call-Remaining 填充，-1=未返回
+}
+
+type ChatContentBlock struct {
+    Type       string          // text | thinking | redacted_thinking | tool_use | tool_result |
+                               //  server_tool_use | mcp_tool_use | mcp_tool_result
+    Text       string          // text 块内容
+    Thinking   string          // thinking 块内容
+    Signature  string          // thinking 块 — Anthropic 签名 (后续请求需回传)
+    Data       string          // redacted_thinking — base64 审查后的思考
+    Citations  interface{}     // text — web_search 引用
+    ID         string          // tool_use / server_tool_use block ID
+    Name       string          // tool_use function name
+    Input      json.RawMessage // tool_use 参数
+    ServerName string          // server/mcp tool — 服务端工具来源
+    Caller     interface{}     // mcp_tool_use — 调用者上下文
+    ToolUseID  string          // tool_result — 关联 tool_use
+    Content    interface{}     // tool_result — 工具返回
+    IsError    *bool           // tool_result
+}
+
+type ChatUsage struct {
+    InputTokens        int
+    OutputTokens       int
+    CacheCreationInput int // prompt cache 创建 token
+    CacheReadInput     int // prompt cache 读取 token
 }
 
 type AnthropicResponse struct {  // /anthropic (Anthropic 格式)
@@ -801,10 +911,30 @@ func ParseSettlement(ev StreamEvent) *StreamSettlement
 
 ```go
 type ThinkingConfig struct {
-    Type         string // adaptive | enabled | disabled
-    BudgetTokens int
-    Display      string // none | summary | "" (完整)
+    Type         string // "adaptive" | "enabled" | "disabled"
+    BudgetTokens int    // 仅 type="enabled"，旧模型回退用
+    Level        string // v0.9.0: "off" | "high" | "max"
+                        //  设置后 SDK 自动组装 thinking + effort + max_tokens
+                        //  为空字符串时 passthrough (v0.8.0 兼容)
+    Display      string // "" (完整) | "summary" | "none"
 }
+
+// v0.9.0 Thinking Level 常量
+const (
+    ThinkingOff  = "off"  // 关闭思考
+    ThinkingHigh = "high" // 标准: thinking=adaptive + effort=high + maxTokens≥32K
+    ThinkingMax  = "max"  // 深度: thinking=adaptive + effort=max + maxTokens=模型上限
+)
+
+// v0.9.0 组装用常量
+const (
+    ThinkingHighMinMaxTokens     = 32_000  // high 级最低 maxTokens
+    ThinkingMaxFallbackMaxTokens = 128_000 // max 级 fallback (caps.MaxOutputTokens 不可用时)
+)
+
+// NewThinkingConfig 便捷构造 (推荐入口)
+// off → {Type:"disabled"}; high/max → {Type:"adaptive", Level:level}
+func NewThinkingConfig(level string) *ThinkingConfig
 
 type ServerTool struct { Type, Name string; Config map[string]interface{} }
 type WebSearchConfig struct {
@@ -1071,9 +1201,10 @@ import (
 )
 
 func main() {
+    // 默认 https://acosmi.com (大陆), 国际站显式传 https://acosmi.ai
     serverURL := os.Getenv("ACOSMI_SERVER_URL")
     if serverURL == "" {
-        serverURL = "https://acosmi.ai"
+        serverURL = "https://acosmi.com"
     }
 
     client, err := acosmi.NewClient(acosmi.Config{ServerURL: serverURL})
@@ -1124,11 +1255,21 @@ func main() {
     }()
 
     for event := range contentCh {
-        var chunk struct {
+        // Anthropic 格式优先, 失败时回退 OpenAI 格式 (详见 §4.3 ChatStream 说明)
+        var ant struct {
+            Type  string `json:"type"`
+            Delta struct{ Type, Text string } `json:"delta"`
+        }
+        if json.Unmarshal([]byte(event.Data), &ant) == nil &&
+            ant.Type == "content_block_delta" && ant.Delta.Text != "" {
+            fmt.Print(ant.Delta.Text)
+            continue
+        }
+        var oai struct {
             Choices []struct{ Delta struct{ Content string `json:"content"` } `json:"delta"` } `json:"choices"`
         }
-        if json.Unmarshal([]byte(event.Data), &chunk) == nil && len(chunk.Choices) > 0 {
-            fmt.Print(chunk.Choices[0].Delta.Content)
+        if json.Unmarshal([]byte(event.Data), &oai) == nil && len(oai.Choices) > 0 {
+            fmt.Print(oai.Choices[0].Delta.Content)
         }
     }
     fmt.Println()
@@ -1181,17 +1322,19 @@ Token 文件: 目录 `0700`，文件 `0600`。下载限制 50MB。
 ```
 acosmi-sdk-go/
 ├── adapter.go             # ProviderAdapter 接口 + 注册表 + getAdapter()
-├── adapter_anthropic.go   # Anthropic 格式 adapter (betas/ServerTools/ExtraBody)
-├── adapter_openai.go      # OpenAI 兼容格式 adapter + 响应/流式转换
+├── adapter_anthropic.go   # Anthropic 格式 adapter (betas/ServerTools/ExtraBody/resolveThinkingLevel)
+├── adapter_openai.go      # OpenAI 兼容格式 adapter + SSE↔Anthropic 事件转换器
 ├── client.go              # 统一 API 客户端 + buildChatRequest (委托 adapter)
-├── auth.go                # OAuth 2.1 PKCE
-├── types.go               # 数据类型 (含 OpenAI 响应类型)
-├── betas.go               # Beta Header 自动组装 (11 项，仅 Anthropic adapter 调用)
-├── store.go               # Token 持久化
-├── scopes.go              # Scope 常量
-├── ws.go                  # WebSocket (自动重连)
+├── client_test.go         # 客户端单元测试
+├── thinking_test.go       # Thinking Level 自动组装测试 (v0.9.0)
+├── auth.go                # OAuth 2.1 PKCE + LoginOption + LoginEvent
+├── types.go               # 数据类型 (Anthropic/OpenAI 响应 + Thinking Level 常量)
+├── betas.go               # Beta Header 自动组装 (10 项，仅 Anthropic adapter 调用)
+├── store.go               # Token 持久化 (文件实现 + TokenStore 接口)
+├── scopes.go              # Scope 常量 (3 分组 + 10 项 Deprecated 细粒度)
+├── ws.go                  # WebSocket (自动重连 + 指数退避)
 ├── cmd/crabclawskill/     # CLI (13 个子命令)
-├── npm/                   # NPM 包装
+├── npm/                   # NPM 包装 (@acosmi/crabclaw-skill)
 ├── docs/guide.md          # 本手册
 └── example/main.go        # 完整示例
 ```
@@ -1231,6 +1374,33 @@ make install    # → $GOPATH/bin
 ---
 
 ## 12. 版本记录
+
+### v0.9.0 — Thinking Level 自动组装
+
+- **feat(thinking)**: 新增三档语义化思考级别 API
+  - 常量: `ThinkingOff` / `ThinkingHigh` / `ThinkingMax`
+  - 便捷构造: `NewThinkingConfig(level)`
+  - `ThinkingConfig` 新增 `Level` 字段 (json:"level,omitempty")
+  - 辅助常量: `ThinkingHighMinMaxTokens` (32K) / `ThinkingMaxFallbackMaxTokens` (128K)
+- **feat(adapter)**: `resolveThinkingLevel` 在 `AnthropicAdapter.BuildRequestBody` 中自动组装
+  - Level 非空时 SDK 接管 `thinking` + `effort` + `max_tokens` 三字段
+  - 模型不支持 `adaptive` 时自动回退 `enabled + budget_tokens = max_tokens - 1`
+  - Level 非 `off` 时自动删除 `temperature` (Anthropic API 互斥约束)
+  - Level=`high`/`max` 且 `SupportsEffort` 时自动注入 `effort-2025-11-24` beta
+- **feat(capabilities)**: `ModelCapabilities` 新增 `SupportsDeepThinking` (Opus 4.6 深度思考门控)
+- **compat**: `Level=""` 时保持 v0.8.0 passthrough — 老代码零影响
+- **test**: `thinking_test.go` 覆盖 off/high/max × adaptive/old model 共 9 个 case + betaEffort 注入 + temperature 互斥
+
+### v0.8.0 — Thinking / Effort Passthrough 兼容基线
+
+- `ThinkingConfig` / `EffortConfig` 保持 passthrough 序列化语义 (调用方自行组装完整字段)
+- 作为 v0.9.0 Level API 的兼容基线 — `Level=""` 时仍走此路径, 老代码零影响
+- (`thinking_test.go` 以 `nil thinking → v0.8.0 passthrough` case 固化此行为)
+
+### v0.7.0 — 文档修订
+
+- 修正开发手册中默认 `ServerURL` 的描述（`acosmi.com` 一直是代码默认, 仅文档误写为 `acosmi.ai`）
+- `acosmi.com` (大陆) 与 `acosmi.ai` (国际) 端点完全兼容, 按业务区域显式传入即可
 
 ### v0.6.0 (2026-04-13) — 通知系统 + 设备注册
 
