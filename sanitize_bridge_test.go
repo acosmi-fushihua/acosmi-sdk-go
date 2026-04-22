@@ -93,6 +93,67 @@ func TestApplyRequestSanitizers_NoConfig_NoOp(t *testing.T) {
 	}
 }
 
+// ---------- S-8: AutoStrip 默认 off, 带 ephemeral 标记的 block 原样透传 ----------
+
+func TestApplyRequestSanitizers_AutoStrip_OffByDefault(t *testing.T) {
+	c := &Client{} // 未调用任何 Set* 方法
+
+	raw := []any{
+		map[string]any{
+			"role": "assistant",
+			"content": []any{
+				map[string]any{"type": "thinking", "thinking": "secret", "acosmi_ephemeral": true},
+				map[string]any{"type": "text", "text": "visible"},
+			},
+		},
+	}
+	req := &ChatRequest{RawMessages: raw}
+
+	if err := c.applyRequestSanitizers(req); err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	// 默认 off: RawMessages 应保持原引用, ephemeral block 仍在
+	got, ok := req.RawMessages.([]any)
+	if !ok {
+		t.Fatalf("RawMessages changed type: %T", req.RawMessages)
+	}
+	if len(got) != 1 {
+		t.Fatalf("expected 1 message, got %d", len(got))
+	}
+	content := got[0].(map[string]any)["content"].([]any)
+	if len(content) != 2 {
+		t.Fatalf("default off should keep all blocks, got %d", len(content))
+	}
+	if content[0].(map[string]any)["type"] != "thinking" {
+		t.Errorf("thinking block should still be present when AutoStrip=off")
+	}
+}
+
+// 显式关 (setter 传 false) 也应 no-op
+func TestApplyRequestSanitizers_AutoStrip_ExplicitOff(t *testing.T) {
+	c := &Client{}
+	c.SetAutoStripEphemeralHistory(true)
+	c.SetAutoStripEphemeralHistory(false) // 切回 off
+
+	raw := []any{
+		map[string]any{
+			"role": "assistant",
+			"content": []any{
+				map[string]any{"type": "thinking", "acosmi_ephemeral": true},
+			},
+		},
+	}
+	req := &ChatRequest{RawMessages: raw}
+	if err := c.applyRequestSanitizers(req); err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	// 无任何配置 → 零开销路径 → RawMessages 引用完全不变
+	if got, _ := req.RawMessages.([]any); len(got) != 1 ||
+		len(got[0].(map[string]any)["content"].([]any)) != 1 {
+		t.Errorf("explicit off should keep ephemeral block intact")
+	}
+}
+
 // ---------- struct 切片 RawMessages 归一化: 走 json roundtrip ----------
 
 func TestApplyRequestSanitizers_StructMessagesNormalization(t *testing.T) {

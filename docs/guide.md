@@ -1,6 +1,6 @@
 # Acosmi Go SDK 开发手册
 
-> v0.11.0 | Go 1.22+ | MIT
+> v0.13.0 | Go 1.22+ | MIT
 
 ## 目录
 
@@ -1388,6 +1388,21 @@ make install    # → $GOPATH/bin
 ---
 
 ## 12. 版本记录
+
+### v0.13.0 (2026-04-22) — OpenAI 格式翻译覆盖扩充 + 完整测试矩阵
+
+在 v0.11.0 基础上, 按 2026-04-22 spec v2 §7 把 v0.11+v0.12+v0.13 的 SDK scope 一次性发全。
+
+- **feat(adapter_openai)**: Anthropic 心智模型 → OpenAI wire format 翻译扩充 3 项
+  - **reasoning_effort** — 从 `Effort.Level` 直接映射 `low/medium/high`; `max` 在 OpenAI 无对应, 退到 `high`。`Thinking.Level` 作次优先级 (`ThinkingHigh/ThinkingMax` → `high`, `ThinkingOff` → 不设)。`Effort` 覆盖 `Thinking`
+  - **response_format** — `OutputConfig.Format = "json_schema"` → `{type:"json_schema", json_schema:{schema,strict:true}}`; `"json_object"` → `{type:"json_object"}`; 未识别的 format 原样透传 (交 Gateway)
+  - **parallel_tool_calls** — `ChatRequest` 新增 `ParallelToolCalls *bool` 字段; `AnthropicAdapter` 忽略(OpenAI 专属)
+- **breaking (minor)**: `OpenAIAdapter.BuildRequestBody` 不再写 `body["thinking"]`/`body["effort"]`/`body["output_config"]` 裸字段; 改为按 OpenAI 规范翻译。若旧代码依赖这三个裸字段透传, 请用 `ExtraBody` 显式注入
+- **test**: +26 单测, 全量 50 单测 + 1 fuzz (2.5M execs 无 panic) 覆盖 S-1~S-15 (除 S-11 物理不可达)
+  - `adapter_openai_test.go` (15) — reasoning_effort 三源 + response_format 四形态 + parallel_tool_calls 三分支 + ExtraBody 两 adapter 透传 + 覆盖同名字段
+  - `client_stream_test.go` (3) — S-10 ctx cancel 关闭 channel / S-12 并发 ChatMessagesStream / S-12 变体并发 blockTypeMap 隔离
+  - `sanitize_bridge_test.go` (+2) — S-8 AutoStrip 默认 off / 显式 off
+- **ci**: 全量测试加 `-race`, 并发隔离验证
 
 ### v0.11.0 (2026-04-22) — Sanitize 包 + StreamEvent Block 元数据 + in-band Ephemeral
 

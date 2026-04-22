@@ -22,6 +22,62 @@ type OpenAIAdapter struct{}
 func (a *OpenAIAdapter) Format() ProviderFormat { return FormatOpenAI }
 func (a *OpenAIAdapter) EndpointSuffix() string  { return "/chat" }
 
+// resolveOpenAIReasoningEffort 把 Anthropic 心智模型的 Thinking/Effort
+// 翻译成 OpenAI `reasoning_effort` 字段值。返回空串表示不设置。
+func resolveOpenAIReasoningEffort(req *ChatRequest) string {
+	// Effort 优先级最高, 因为它本身就是通用级别语义
+	if req.Effort != nil && req.Effort.Level != "" {
+		switch req.Effort.Level {
+		case "low", "medium", "high":
+			return req.Effort.Level
+		case "max":
+			// OpenAI 无 max 级别, 等价最深 = high
+			return "high"
+		}
+	}
+	// Thinking.Level 次之
+	if req.Thinking != nil {
+		switch req.Thinking.Level {
+		case ThinkingHigh:
+			return "high"
+		case ThinkingMax:
+			return "high"
+		case ThinkingOff:
+			return ""
+		}
+	}
+	return ""
+}
+
+// resolveOpenAIResponseFormat 把 OutputConfig 翻译成 OpenAI response_format。
+// 返回 nil 表示不设置。
+func resolveOpenAIResponseFormat(req *ChatRequest) map[string]any {
+	if req.OutputConfig == nil {
+		return nil
+	}
+	switch req.OutputConfig.Format {
+	case "json_schema":
+		// OpenAI schema 形态: {type:"json_schema", json_schema:{schema:{...},strict:true}}
+		js := map[string]any{}
+		if req.OutputConfig.Schema != nil {
+			js["schema"] = req.OutputConfig.Schema
+		}
+		// strict 默认开, 与 json_schema 模式语义一致
+		js["strict"] = true
+		return map[string]any{
+			"type":        "json_schema",
+			"json_schema": js,
+		}
+	case "json_object":
+		return map[string]any{"type": "json_object"}
+	case "":
+		return nil
+	default:
+		// 未知 format, 原样透传, 交 Gateway 处理
+		return map[string]any{"type": req.OutputConfig.Format}
+	}
+}
+
 // BuildRequestBody 构建 OpenAI 兼容格式请求体
 // 不注入 Anthropic betas，扩展字段（thinking/effort/speed）以通用 JSON 传递
 func (a *OpenAIAdapter) BuildRequestBody(caps ModelCapabilities, req *ChatRequest) (map[string]any, error) {
@@ -54,21 +110,39 @@ func (a *OpenAIAdapter) BuildRequestBody(caps ModelCapabilities, req *ChatReques
 		body["tools"] = req.Tools
 	}
 
-	// ── 扩展字段（通用 JSON 传递，Gateway adapter 转换为厂商格式）──
-	if req.Thinking != nil {
-		body["thinking"] = req.Thinking
+	// ── 扩展字段 (v0.13.0: 按 OpenAI wire format 直接翻译) ──
+
+	// Thinking / Effort → reasoning_effort
+	// OpenAI 系只有顶层 `reasoning_effort: "low"|"medium"|"high"`, 无 thinking block;
+	// 能接收到 reasoning_content (GLM/DeepSeek) 作为响应, 但请求侧只能控制级别。
+	//
+	// 翻译优先级:
+	//   req.Effort.Level 非空  → 直接用 (低/中/高)
+	//   req.Thinking.Level 非空 → ThinkingOff=不设; ThinkingHigh=high; ThinkingMax=high
+	//                              (OpenAI 无 "max" 级别, 落到 high 等价最深)
+	//   旧代码已手工设的 thinking 字段 → 保留 passthrough (ExtraBody 或调用方自设)
+	if eff := resolveOpenAIReasoningEffort(req); eff != "" {
+		body["reasoning_effort"] = eff
 	}
-	if req.Effort != nil {
-		body["effort"] = req.Effort
-	}
+
 	if req.Speed != "" {
 		body["speed"] = req.Speed
 	}
-	if req.OutputConfig != nil {
-		body["output_config"] = req.OutputConfig
+
+	// OutputConfig → response_format
+	// Anthropic 心智模型通过 system prompt + prefill 实现 JSON 模式;
+	// OpenAI 有顶层 response_format, SDK 直接翻译。
+	if rf := resolveOpenAIResponseFormat(req); rf != nil {
+		body["response_format"] = rf
 	}
+
 	if req.Metadata != nil {
 		body["metadata"] = req.Metadata
+	}
+
+	// parallel_tool_calls 是 OpenAI 原生字段, 无歧义直接写。
+	if req.ParallelToolCalls != nil {
+		body["parallel_tool_calls"] = *req.ParallelToolCalls
 	}
 
 	// ── 不注入 Anthropic Betas ──

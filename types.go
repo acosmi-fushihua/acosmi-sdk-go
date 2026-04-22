@@ -166,6 +166,13 @@ type ChatRequest struct {
 	Effort      *EffortConfig          `json:"-"` // 推理努力级别
 	OutputConfig *OutputConfig         `json:"-"` // 结构化输出配置
 	ExtraBody   map[string]interface{} `json:"-"` // 任意扩展字段 (buildChatRequest 合入请求体)
+
+	// v0.13.0: OpenAI wire format 原生字段。AnthropicAdapter 忽略,
+	// OpenAIAdapter 按 OpenAI 规范序列化。
+	//
+	// ParallelToolCalls 对应 OpenAI `parallel_tool_calls` 顶层字段,
+	// 控制模型能否在单次响应中发多个 tool_call。nil = 不设置 (沿用上游默认 true)。
+	ParallelToolCalls *bool `json:"-"`
 }
 
 // ---------- Chat 扩展类型 ----------
