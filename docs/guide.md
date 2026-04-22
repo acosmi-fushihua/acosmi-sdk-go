@@ -1,6 +1,6 @@
 # Acosmi Go SDK 开发手册
 
-> v0.13.0 | Go 1.22+ | MIT
+> v0.13.1 | Go 1.22+ | MIT
 
 ## 目录
 
@@ -1388,6 +1388,28 @@ make install    # → $GOPATH/bin
 ---
 
 ## 12. 版本记录
+
+### v0.13.1 (2026-04-22) — 网关侧 spec v2 §3-§8 全量交付 (docs-only)
+
+SDK 代码无改动, 仅文档与状态更新。对应网关侧 commit 参见 Chat-Acosmi 主仓
+`feat(gateway): spec v2 §3-§8 网关侧全量实施 (7 Phase)` (49ce9e54+)。
+
+- **网关侧 7 Phase 完成** (内部版本, 无外部 tag):
+  - **G1**: `ProviderCapability` 子包 + 6 preset (anthropic-official / aliyun-dashscope / openrouter / deepseek / third-party-default / openai-compat)
+  - **G2**: 13 步 Sanitizer 流水 (block 白名单 / cache_control / system 降级 / 顶层字段剥 / betas body↔header / tool 字段白名单 / tool_choice 校验 / tool_result.is_error 剥 / max_tokens 夹紧 / stop_sequences 截断 / 多模态校验)
+  - **G3**: wire format 双向转换 (system 位置 / tool_use↔tool_calls / image base64↔data URI / stop_reason 值空间 / reasoning_content→thinking block)
+  - **G4**: 响应侧 **in-band `acosmi_ephemeral`** 注入 (spec v2 根因方案) + AllowedResponseBlocks 白名单 (未知 block 三联丢弃)
+  - **G5**: Server Tool 降级 (`web_search` 改写 client tool schema + SSE index 单调偏移合并两轮)
+  - **G6**: 错误分类 (`GatewayError.Kind` = `arrearage/invalid_request/authentication/rate_limit/server/overloaded`) + Retry-After 三形态解析
+  - **G7**: 接入 `ChatStream/ChatSync` 主流程 + 53 单测 全 `-race` PASS
+- **效果**: SDK v0.11.0 引入的 `SetAutoStripEphemeralHistory(true)` 现已**完全工作** —— 网关在 Anthropic 响应链路的 `content_block_start.content_block` 注入 `acosmi_ephemeral:true` 标记 thinking / redacted_thinking / server_tool_use 等 block, 下一轮 SDK 自动剥除
+- **根因闭环**: 2026-04-22 产线 `tool_reference 400` 故障从 SDK 路由 + 网关 sanitize 双侧杜绝 (R-1 regression 通过)
+- **向后兼容**: 未登记 preset 的 provider 在网关侧回落到现 `adapt*` 逻辑; OpenAI 路径 (`/chat`) 不经过 sanitize, 保留 DashScope `enable_thinking` / VolcEngine `plugins.web_search` 等已有特殊适配
+- **交叉复核修复 4 项** (代码层审计产出, 已回归验证):
+  - `openai-compat` preset `SupportsThinkingRequest` 由 true 改 false (避免绕过 SDK 的 raw thinking 字段透给 OpenAI 上游 400)
+  - `stringifyArguments(map)` 用 `encoding/json` 而非 `fmt.Sprintf("%v")` (原实现产出 Go map 表示非 JSON, OpenAI 解析 arguments 失败)
+  - `parseArguments(string)` 用 `json.Unmarshal` 解到 map (原实现原样返字符串, Anthropic `tool_use.input` 规范要求 object)
+  - `transformer.handleBlockStart` content_block.type 缺失时保守透传 (原实现 fallback 到顶层 "content_block_start" 被当未知 block 误丢)
 
 ### v0.13.0 (2026-04-22) — OpenAI 格式翻译覆盖扩充 + 完整测试矩阵
 
