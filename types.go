@@ -502,6 +502,20 @@ func (r *AnthropicResponse) ToolUseBlocks() []AnthropicContentBlock {
 type StreamEvent struct {
 	Event string `json:"event"`
 	Data  string `json:"data"`
+
+	// ── v0.11.0 新增: content block 元数据 (json:"-", 仅内存透传) ──
+	// 零值等价 v0.10.0 行为, 未识别的事件 (message_start / message_delta /
+	// message_stop / 非 Anthropic) 三字段全部零值。
+	//
+	// BlockIndex 对齐 Anthropic content_block_start/delta/stop 的 index 字段;
+	// 其他事件为 0 (与合法 index=0 无法区分, 用 BlockType 非空判别)。
+	BlockIndex int
+	// BlockType 由 content_block_start 解析得到, delta/stop 从 index→type 映射查出。
+	BlockType string
+	// Ephemeral 为 true 表示网关标记此 block 下一轮不应回传。来源于
+	// content_block_start.content_block.acosmi_ephemeral in-band 字段,
+	// 由 SDK 解析后沿 blockTypeMap 传播给 delta/stop 事件。
+	Ephemeral bool
 }
 
 // StreamSettlement 流式结算事件 (从 settled SSE 事件解析)

@@ -1,6 +1,6 @@
 # Acosmi Go SDK 开发手册
 
-> v0.10.0 | Go 1.22+ | MIT
+> v0.11.0 | Go 1.22+ | MIT
 
 ## 目录
 
@@ -1388,6 +1388,76 @@ make install    # → $GOPATH/bin
 ---
 
 ## 12. 版本记录
+
+### v0.11.0 (2026-04-22) — Sanitize 包 + StreamEvent Block 元数据 + in-band Ephemeral
+
+全新增字段 / 枚举, 零值等价 v0.10.0 行为, 未接入的消费者无感。
+
+- **feat(sanitize)**: 新增 `github.com/acosmi/acosmi-sdk-go/sanitize` 子包
+  - `BlockType` 枚举 (16 种 content block 类型, 覆盖 Anthropic 请求/响应 + ephemeral)
+  - `DeltaType` 枚举 (text_delta / input_json_delta / thinking_delta / signature_delta / citations_delta)
+  - `MinimalSanitizeConfig` — 底线防御配置 (base64 体积上限 + history 深度上限 + `PermanentDenyBlocks` 黑名单)
+  - `Sanitize(messages, cfg) ([]any, error)` — 早失败式体积校验 + deny-list 剥除 + tool_use_id 联动剥 tool_result
+  - `StripEphemeral(messages) []any` — 按 in-band `acosmi_ephemeral:true` 标记剥历史, 联动剥对应 tool_result
+  - `EphemeralMarkerField = "acosmi_ephemeral"` — 网关/消费者共享的标记字段名常量
+- **feat(client)**: 两个 Client 级钩子, 未配置时零开销
+  - `SetDefensiveSanitize(cfg sanitize.MinimalSanitizeConfig)` — 每次 Chat/ChatStream/ChatMessages* 请求前执行
+  - `SetAutoStripEphemeralHistory(on bool)` — 开启后自动扫 `RawMessages` 剥 ephemeral block
+- **feat(types)**: `StreamEvent` 新增 3 个 `json:"-"` 字段 (零值兼容)
+  - `BlockIndex int` — 对齐 Anthropic `content_block_*` 的 index
+  - `BlockType string` — 从 `content_block_start.content_block.type` 解出, delta/stop 查 map 继承
+  - `Ephemeral bool` — 从 `content_block_start.content_block.acosmi_ephemeral` in-band 字段解出
+- **feat(stream)**: Anthropic SSE 循环维护 `blockTypeMap[index] → meta`, 单 goroutine 无锁
+  - 零额外缓冲: in-band 标记随 `content_block_start` JSON 同步到达, 不需要独立 SSE meta 事件, 无顺序依赖
+  - 零延迟: 标记解析与原事件透传同一 tick
+  - `content_block_stop` 后删表项, 长流无累积
+- **compat**: 所有新字段零值等价旧行为; `Sanitize` 未调用时 `buildChatRequest` 完全跳过新路径; v0.10.0 消费者零改动升级
+- **test**: +24 单测 + 1 fuzz, 2.5M 次无 panic
+  - `sanitize/defensive_test.go` — S-1/S-2/S-3/S-9 (体积/deny/深度 + data URL 前缀兜底 + URL 源跳过)
+  - `sanitize/history_test.go` — StripEphemeral + H-2 tool_use_id 联动 + 零拷贝 + malformed 不 panic
+  - `sanitize/fuzz_test.go` — S-15 喂任意 JSON, 覆盖 255 个 interesting input
+  - `stream_meta_test.go` — S-4/S-5 (index/type/ephemeral 映射, delta/stop 继承, 非 block 事件不污染)
+  - `sanitize_bridge_test.go` — Messages/RawMessages 两分支深度校验 + struct 切片归一化 + 零配置 no-op
+
+#### 使用示例
+
+```go
+import "github.com/acosmi/acosmi-sdk-go/sanitize"
+
+client, _ := acosmi.NewClient(acosmi.Config{ServerURL: "https://acosmi.com"})
+
+// 启用底线防御 (可选, 按需配置)
+client.SetDefensiveSanitize(sanitize.MinimalSanitizeConfig{
+    MaxImageBytes:    5 * 1024 * 1024,   // 图片 ≤5MB 早失败
+    MaxVideoBytes:    50 * 1024 * 1024,
+    MaxPDFBytes:      10 * 1024 * 1024,
+    MaxMessagesTurns: 100,
+    // PermanentDenyBlocks 按需追加, 默认留空 (由网关决定)
+})
+
+// 开启自动剥离 ephemeral 历史 (网关 in-band 标记的 thinking / server_tool_use 等)
+client.SetAutoStripEphemeralHistory(true)
+
+// 流式消费示例: 使用 BlockType / Ephemeral 过滤 UI 展示
+for ev := range eventCh {
+    if ev.BlockType == string(sanitize.BlockThinking) && ev.Ephemeral {
+        // thinking 块, UI 可隐藏或折叠, 下一轮 SDK 自动不回传
+        continue
+    }
+    // ... 其他展示逻辑
+}
+```
+
+#### 与网关协议约定 (in-band ephemeral)
+
+网关在 `content_block_start` 的 JSON payload 里直接注入 `acosmi_ephemeral: true` 字段, 例如:
+
+```
+event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","acosmi_ephemeral":true}}
+```
+
+选择 in-band 而非独立 `event: acosmi_meta` 事件的理由: **零缓冲 / 零顺序依赖 / 零延迟 / history 剥离天然可做** (消费者 history 中的 block 自带标记, SDK 无需另外记忆)。
 
 ### v0.10.0 (2026-04-22) — Capability-driven Adapter 路由 ⚠️ 破坏性
 

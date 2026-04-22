@@ -14,6 +14,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/acosmi/acosmi-sdk-go/sanitize"
 )
 
 // 安全限制常量
@@ -38,6 +40,10 @@ type Client struct {
 	// 模型能力缓存 (CrabCode 扩展)
 	modelCache     []ManagedModel // ListModels 缓存
 	modelCacheTime time.Time      // 缓存写入时间
+
+	// v0.11.0: 请求前防御钩子。nil = 未启用, 零开销。
+	defensiveCfg       *sanitize.MinimalSanitizeConfig
+	autoStripEphemeral bool
 }
 
 // Config 客户端配置
@@ -389,6 +395,11 @@ func (c *Client) getCachedModel(modelID string) ManagedModel {
 //
 // 返回: (请求体 JSON, 使用的 adapter, 错误)
 func (c *Client) buildChatRequest(modelID string, req *ChatRequest) ([]byte, ProviderAdapter, error) {
+	// v0.11.0: 请求前防御 (体积 / deny-list / 深度 / ephemeral 剥离)。未配置时零开销。
+	if err := c.applyRequestSanitizers(req); err != nil {
+		return nil, nil, err
+	}
+
 	adapter := getAdapterForModel(c.getCachedModel(modelID))
 	caps, _ := c.getCachedCapabilities(modelID)
 
@@ -647,14 +658,23 @@ func (c *Client) chatMessagesStreamInternal(ctx context.Context, modelID string,
 			}
 		}
 	} else {
-		// Anthropic SSE: 原生事件直透
+		// Anthropic SSE: 原生事件直透 + v0.11.0 content block 元数据回填
 		var currentEvent string
+		blockTypeMap := make(map[int]blockMeta)
 		for scanner.Scan() {
 			line := scanner.Text()
 			if after, ok := strings.CutPrefix(line, "event:"); ok {
 				currentEvent = strings.TrimSpace(after)
 			} else if after, ok := strings.CutPrefix(line, "data:"); ok {
-				eventCh <- StreamEvent{Event: currentEvent, Data: strings.TrimSpace(after)}
+				data := strings.TrimSpace(after)
+				ev := StreamEvent{Event: currentEvent, Data: data}
+				idx, bt, eph := extractAnthropicBlockMeta(currentEvent, data, blockTypeMap)
+				if bt != "" {
+					ev.BlockIndex = idx
+					ev.BlockType = bt
+					ev.Ephemeral = eph
+				}
+				eventCh <- ev
 			}
 		}
 	}
@@ -743,20 +763,35 @@ func (c *Client) chatStreamInternal(ctx context.Context, modelID string, req Cha
 	scanner := bufio.NewScanner(resp.Body)
 	scanner.Buffer(make([]byte, 0, maxSSELineSize), maxSSELineSize)
 
+	// v0.11.0: Anthropic 格式下维护 index→meta 映射, OpenAI 无 block 概念跳过。
+	var blockTypeMap map[int]blockMeta
+	if adapter.Format() == FormatAnthropic {
+		blockTypeMap = make(map[int]blockMeta)
+	}
+
 	var currentEvent string
 	for scanner.Scan() {
 		line := scanner.Text()
 		if after, ok := strings.CutPrefix(line, "event:"); ok {
 			currentEvent = strings.TrimSpace(after)
 		} else if after, ok := strings.CutPrefix(line, "data:"); ok {
+			data := strings.TrimSpace(after)
 			// 使用 adapter 解析每行
-			evt, done, parseErr := adapter.ParseStreamLine(currentEvent, strings.TrimSpace(after))
+			evt, done, parseErr := adapter.ParseStreamLine(currentEvent, data)
 			if parseErr != nil {
 				errCh <- parseErr
 				return
 			}
 			if done {
 				return
+			}
+			if blockTypeMap != nil {
+				idx, bt, eph := extractAnthropicBlockMeta(currentEvent, data, blockTypeMap)
+				if bt != "" {
+					evt.BlockIndex = idx
+					evt.BlockType = bt
+					evt.Ephemeral = eph
+				}
 			}
 			eventCh <- evt
 		}
