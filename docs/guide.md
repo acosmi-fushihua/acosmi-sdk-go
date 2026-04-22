@@ -1,6 +1,6 @@
 # Acosmi Go SDK 开发手册
 
-> v0.9.0 | Go 1.22+ | MIT
+> v0.10.0 | Go 1.22+ | MIT
 
 ## 目录
 
@@ -335,9 +335,10 @@ for event := range eventCh {
 
 #### Anthropic 原生格式 — ChatMessages (V8)
 
-v0.5.0: 根据模型 provider 自动路由:
-- **Anthropic/Acosmi** → `POST /managed-models/:id/anthropic` (Anthropic 协议)
-- **其他厂商** → `POST /managed-models/:id/chat` (OpenAI 兼容格式，响应自动转换为 AnthropicResponse)
+v0.10.0: 路由由模型 `preferred_format` / `supported_formats` 字段驱动, 不再硬编码 provider 名:
+- **preferred_format = "anthropic"** → `POST /managed-models/:id/anthropic` (Anthropic 协议)
+- **preferred_format = "openai"** → `POST /managed-models/:id/chat` (OpenAI 兼容格式，响应自动转换为 AnthropicResponse)
+- **字段为空 (旧 Gateway)** → 回落 v0.5.0 provider 硬编码: Anthropic/Acosmi 走 `/anthropic`, 其他走 `/chat`
 
 调用方无需感知 provider 差异，SDK 内部自动处理格式转换。
 
@@ -391,18 +392,29 @@ if err := <-errCh; err != nil {
 | 流式控制事件 | started/settled/pending_settle/failed/[DONE] | Anthropic SSE (message_stop 自然结束) |
 | Provider 限制 | 所有 provider | 所有 provider (v0.5.0 Adapter 自动转换) |
 
-**v0.5.0 Provider Adapter 路由规则:**
+**v0.10.0 Capability-driven 路由规则:**
 
-| Provider | Adapter | 端点后缀 | Betas 注入 | SSE 格式 |
-|----------|---------|----------|-----------|---------|
-| Anthropic | AnthropicAdapter | `/anthropic` | 是 (10 项) | Anthropic 原生 |
-| Acosmi | AnthropicAdapter | `/anthropic` | 是 | Anthropic 原生 |
-| DeepSeek | OpenAIAdapter | `/chat` | 否 | OpenAI → Anthropic 转换 |
-| DashScope (Qwen) | OpenAIAdapter | `/chat` | 否 | OpenAI → Anthropic 转换 |
-| Zhipu (GLM) | OpenAIAdapter | `/chat` | 否 | OpenAI → Anthropic 转换 |
-| Moonshot (Kimi) | OpenAIAdapter | `/chat` | 否 | OpenAI → Anthropic 转换 |
-| VolcEngine (豆包) | OpenAIAdapter | `/chat` | 否 | OpenAI → Anthropic 转换 |
-| 其他 | OpenAIAdapter | `/chat` | 否 | OpenAI → Anthropic 转换 |
+SDK 通过 `getAdapterForModel(model)` 按以下**四层优先级**选择 adapter:
+
+1. `model.PreferredFormat == "anthropic"` → AnthropicAdapter
+2. `model.PreferredFormat == "openai"` → OpenAIAdapter
+3. `model.SupportedFormats` 含 "anthropic" → AnthropicAdapter (否则 "openai" → OpenAIAdapter)
+4. 均为空 (旧 Gateway 未返回字段) → 回落 provider 硬编码: `{anthropic, acosmi}` → AnthropicAdapter, 其余 → OpenAIAdapter
+
+**上游默认**（Gateway v0.10.0+ 在 `/models` 响应里填充）:
+
+| Provider | supported_formats | preferred_format | 端点后缀 | Betas 注入 |
+|----------|------|------|------|------|
+| Anthropic | `["anthropic","openai"]` | `anthropic` | `/anthropic` | 是 (10 项) |
+| Acosmi | 同 Anthropic (hardcode 回落) | — | `/anthropic` | 是 |
+| DashScope (Qwen) | `["anthropic","openai"]` | `anthropic` | **`/anthropic`** ⚠️ v0.10.0 起改从 `/chat` 切换 | 是 |
+| Zhipu (GLM) | `["anthropic","openai"]` | `anthropic` | **`/anthropic`** ⚠️ | 是 |
+| DeepSeek | `["anthropic","openai"]` | `anthropic` | **`/anthropic`** ⚠️ | 是 |
+| OpenAI | `["openai"]` | `openai` | `/chat` | 否 |
+| VolcEngine (豆包) | `["openai"]` | `openai` | `/chat` | 否 |
+| Custom | `["openai"]` | `openai` | `/chat` | 否 |
+
+> **⚠️ 破坏性变更 (v0.10.0)**: DashScope / Zhipu / DeepSeek 默认切到 Anthropic 协议端点 — 这三家 Gateway 侧本就内置 Anthropic 兼容端点, 但 v0.9.x 及以前 SDK 按 provider 名硬编码走 `/chat`, 导致 `tool_reference` 等 Anthropic 专属 content block 被 Rust gateway 严格校验 400 拒绝。若需保留旧行为, 手动在 `ManagedModel.PreferredFormat` 置 `"openai"` 或 Gateway 侧只返回 `supported_formats: ["openai"]`。
 
 > 注: OpenAIAdapter 不注入 Anthropic betas，扩展字段 (thinking/effort/speed) 以通用 JSON 透传给 Nexus Gateway，由 Gateway per-provider adapter 转换为厂商格式。
 
@@ -768,6 +780,8 @@ type ManagedModel struct {
     IsEnabled, IsDefault        bool
     PricePerMTok                float64
     Capabilities                ModelCapabilities
+    SupportedFormats            []string // v0.10.0: ["anthropic","openai"], 上游可选
+    PreferredFormat             string   // v0.10.0: "anthropic" | "openai", 空则取 SupportedFormats[0]
 }
 
 type ModelCapabilities struct {
@@ -1374,6 +1388,22 @@ make install    # → $GOPATH/bin
 ---
 
 ## 12. 版本记录
+
+### v0.10.0 (2026-04-22) — Capability-driven Adapter 路由 ⚠️ 破坏性
+
+- **fix(adapter)**: 根因修复 CrabCode TUI 在 DashScope/Zhipu/DeepSeek 等 provider 使用 WebSearch + ToolSearch 时报 `HTTP 400: unknown variant tool_reference` 的问题
+  - 根因: v0.5.0 `getAdapter(provider string)` 按 provider 名硬编码, 非 `{anthropic, acosmi}` 的 provider 永远走 OpenAIAdapter → `/chat` 端点, 但 `tool_reference` 等 Anthropic 专属 content block 无法被 Rust gateway OpenAI 校验器接受
+- **feat(types)**: `ManagedModel` 新增两个字段 (上游 Gateway 在 `/models` 响应中填充)
+  - `SupportedFormats []string` — 上游启用的请求格式列表 (`"anthropic"` / `"openai"`)
+  - `PreferredFormat string` — 推荐客户端优先使用的格式
+  - 两字段均 `omitempty`, 旧 Gateway 未填时 SDK 回落 provider 硬编码 (向后兼容)
+- **feat(adapter)**: 新增 `getAdapterForModel(m ManagedModel)` 替代 `getAdapter(provider string)`
+  - 四层优先级: `PreferredFormat` → `SupportedFormats` → provider 硬编码回落
+  - 大小写不敏感 (`"Anthropic"` / `"ANTHROPIC"` 均有效)
+- **refactor(client)**: `buildChatRequest` / `ChatMessages` 调用点改读完整 `ManagedModel` (新 `getCachedModel`), 废弃 `getModelProvider`
+- **breaking**: DashScope / Zhipu / DeepSeek 三家 provider 的模型, 如上游返回 `preferred_format: "anthropic"`, 请求将从 `/chat` 切换到 `/anthropic` 端点。若需保留旧行为, Gateway 侧把 `SupportedFormats` 限定为 `["openai"]` 或 `PreferredFormat: "openai"` 即可显式覆盖
+- **compat**: 旧版 SDK 读不到新字段, 继续走 `/chat` — 向后兼容未破坏
+- **test**: `adapter_test.go` 覆盖 8 个用例 — PreferredFormat 覆盖硬编码 / SupportedFormats 多值选择 / 大小写 / 空值回落
 
 ### v0.9.0 — Thinking Level 自动组装
 

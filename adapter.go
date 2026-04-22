@@ -9,6 +9,8 @@
 
 package acosmi
 
+import "strings"
+
 // ProviderFormat 标识请求格式
 type ProviderFormat int
 
@@ -48,10 +50,51 @@ var adapterRegistry = map[string]ProviderAdapter{
 // defaultOpenAIAdapter 是非 Anthropic 厂商的默认 adapter
 var defaultOpenAIAdapter ProviderAdapter = &OpenAIAdapter{}
 
-// getAdapter 根据 provider 返回对应的 adapter
+// getAdapter 根据 provider 返回对应的 adapter (v0.5.0 遗留 API, 向后兼容)
+// 新代码应使用 getAdapterForModel, 以便读取 ManagedModel 的格式能力字段
 func getAdapter(provider string) ProviderAdapter {
-	if a, ok := adapterRegistry[provider]; ok {
+	if a, ok := adapterRegistry[strings.ToLower(provider)]; ok {
 		return a
 	}
 	return defaultOpenAIAdapter
+}
+
+// getAdapterForModel 按 ManagedModel 的 PreferredFormat / SupportedFormats 选择 adapter
+//
+// 决策顺序:
+//  1. PreferredFormat 非空 → 按其值返回 (anthropic | openai)
+//  2. SupportedFormats 含 "anthropic" → AnthropicAdapter
+//  3. SupportedFormats 含 "openai" → OpenAIAdapter
+//  4. 两字段均空 (旧上游) → 回落 provider 名硬编码 (原 getAdapter 行为)
+//
+// 这使得 dashscope / zhipu / deepseek 等 provider 的模型如果上游启用了
+// Anthropic 兼容端点 (providerAnthropicEndpoints 命中), 也能走 /anthropic 路径,
+// 不再被 provider 字符串硬编码到 /chat 导致 tool_reference 400.
+func getAdapterForModel(m ManagedModel) ProviderAdapter {
+	switch strings.ToLower(strings.TrimSpace(m.PreferredFormat)) {
+	case "anthropic":
+		return &AnthropicAdapter{}
+	case "openai":
+		return &OpenAIAdapter{}
+	}
+
+	hasAnthropic := false
+	hasOpenAI := false
+	for _, f := range m.SupportedFormats {
+		switch strings.ToLower(strings.TrimSpace(f)) {
+		case "anthropic":
+			hasAnthropic = true
+		case "openai":
+			hasOpenAI = true
+		}
+	}
+	if hasAnthropic {
+		return &AnthropicAdapter{}
+	}
+	if hasOpenAI {
+		return &OpenAIAdapter{}
+	}
+
+	// 旧上游未填字段: 回落到 provider 名硬编码 (向后兼容)
+	return getAdapter(strings.ToLower(m.Provider))
 }

@@ -368,17 +368,17 @@ func (c *Client) getCachedCapabilities(modelID string) (ModelCapabilities, bool)
 
 // [RC-2] GetModelUsage 已移除: /managed-models/usage 端点已迁移至 tk-dist 营销系统
 
-// getModelProvider 从模型缓存中获取 provider 字段
-// 默认回退 "anthropic"（兼容未调用 ListModels 的场景）
-func (c *Client) getModelProvider(modelID string) string {
+// getCachedModel 从缓存中查找完整 ManagedModel (线程安全)
+// 未命中时返回仅含 Provider 的占位值, 保证 getAdapterForModel 能回落 provider 硬编码
+func (c *Client) getCachedModel(modelID string) ManagedModel {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	for _, m := range c.modelCache {
 		if m.ID == modelID || m.ModelID == modelID {
-			return m.Provider
+			return m
 		}
 	}
-	return "anthropic" // 默认回退
+	return ManagedModel{Provider: "anthropic"}
 }
 
 // buildChatRequest 构建完整的聊天请求体（v0.5.0 adapter 模式）
@@ -389,8 +389,7 @@ func (c *Client) getModelProvider(modelID string) string {
 //
 // 返回: (请求体 JSON, 使用的 adapter, 错误)
 func (c *Client) buildChatRequest(modelID string, req *ChatRequest) ([]byte, ProviderAdapter, error) {
-	provider := c.getModelProvider(modelID)
-	adapter := getAdapter(provider)
+	adapter := getAdapterForModel(c.getCachedModel(modelID))
 	caps, _ := c.getCachedCapabilities(modelID)
 
 	body, err := adapter.BuildRequestBody(caps, req)
@@ -454,8 +453,7 @@ func (c *Client) Chat(ctx context.Context, modelID string, req ChatRequest) (*Ch
 //   Anthropic → chatMessagesAnthropic（现有路径，POST /anthropic）
 //   其他厂商 → chatMessagesOpenAI（POST /chat，响应转换为 AnthropicResponse）
 func (c *Client) ChatMessages(ctx context.Context, modelID string, req ChatRequest) (*AnthropicResponse, error) {
-	provider := c.getModelProvider(modelID)
-	adapter := getAdapter(provider)
+	adapter := getAdapterForModel(c.getCachedModel(modelID))
 
 	if adapter.Format() == FormatAnthropic {
 		return c.chatMessagesAnthropic(ctx, modelID, req, adapter)

@@ -63,6 +63,16 @@ type ManagedModel struct {
 	IsDefault     bool              `json:"isDefault,omitempty"`
 	ContextWindow int               `json:"contextWindow,omitempty"`
 	Capabilities  ModelCapabilities `json:"capabilities"` // 模型能力矩阵 (CrabCode 消费)
+
+	// SupportedFormats 上游 gateway 为此模型启用的请求格式列表
+	// 取值: "anthropic" | "openai"
+	// 示例: ["anthropic"] / ["openai"] / ["anthropic","openai"]
+	// 空值表示上游未声明, SDK 回落 provider 硬编码分支 (向后兼容)
+	SupportedFormats []string `json:"supported_formats,omitempty"`
+
+	// PreferredFormat 上游建议客户端优先使用的格式
+	// 取值: "anthropic" | "openai"; 空值等价于 SupportedFormats[0]
+	PreferredFormat string `json:"preferred_format,omitempty"`
 }
 
 // ModelCapabilities 模型能力矩阵
