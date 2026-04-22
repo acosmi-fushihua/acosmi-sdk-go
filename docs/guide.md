@@ -1,6 +1,6 @@
 # Acosmi Go SDK 开发手册
 
-> v0.13.1 | Go 1.22+ | MIT
+> v0.13.2 | Go 1.22+ | MIT
 
 ## 目录
 
@@ -1388,6 +1388,28 @@ make install    # → $GOPATH/bin
 ---
 
 ## 12. 版本记录
+
+### v0.13.2 (2026-04-22) — 网关侧 Anthropic 端点漂移根治 (docs-only)
+
+SDK 代码无改动, 仅文档。对应网关侧 commit `refactor(gateway): Anthropic 端点统一读 capability preset — 删双表根治漂移` (42ca1e51)。
+
+背景:
+commit 608da8bd (2026-04-10) 在 `service/model_gateway.go` 建 `providerAnthropicEndpoints` 副表时, DashScope/Zhipu/DeepSeek 三条漏写 `/v1/messages`; 而 `ChatStream/ChatSync` 对 Anthropic 路由约定"端点已包含完整路径, 不拼接后缀" → Anthropic 格式请求被直送裸路径 → 上游 400 `Request body format invalid`。
+
+根因定性:
+副表与 `capability/presets/*.go` 是两套独立端点声明 (spec v2 §2 明确 preset 为 SSOT), 前者漂移即引故障。过去多次补这张副表的值是在补副本, 而非消除冗余。
+
+根因修复:
+- **删 `providerAnthropicEndpoints`**: `ResolveEndpoint` 对 Anthropic 路由直接读 `capability.Lookup(provider).UpstreamBaseURL + UpstreamPath`, 信息只剩 preset 一份, 不可能再漂移。
+- **删隐式后缀拼接**: 上一轮 "normalize auto-append /v1/messages" 本身亦是补丁。`customEndpoint` 非空时字面用 (仅去尾 /), admin 自行负责完整性; 留空则 preset 保证对。
+- **新增 `capability.Zhipu` + `presets/zhipu.go`**: 过去 `Lookup("zhipu")` 返回 nil 导致 Anthropic 路由沿 OpenAI 端点回落, 现在 Zhipu 正常走 Anthropic 管线 (含 sanitize / ephemeral 注入 / 白名单过滤全套 spec v2 能力)。
+- **init() 交叉校验**: `model.SupportedAnthropicFormatProviders()` 中每个 provider 必须有 preset 且 `WireFormat=FormatAnthropicMessages`, 否则启动期 panic; 声明与 preset 不一致时立即暴露。
+- **契约单测**: `TestGateway_ResolveEndpoint_AnthropicFormat_FromPreset` 锁定 4 个 Anthropic-兼容 provider 解析产出完整 `…/v1/messages` URL, 未来漂移 CI 即红。
+
+对 SDK 用户的影响:
+- Zhipu 走 Anthropic 格式现在可用 (过去隐性回落 OpenAI, spec v2 能力链路缺失)。
+- DashScope / DeepSeek / Anthropic 原生 Anthropic 格式无需 admin 再手动在后台填完整 URL, 留空即正确。
+- 自定义 endpoint 行为变更 (轻微 Breaking): 过去无隐式后缀拼接, 本次重申此语义; 若此前依赖填 base URL 再被拼接 → 需要管理员补完。
 
 ### v0.13.1 (2026-04-22) — 网关侧 spec v2 §3-§8 全量交付 (docs-only)
 
