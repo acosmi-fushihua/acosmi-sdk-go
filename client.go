@@ -374,17 +374,60 @@ func (c *Client) getCachedCapabilities(modelID string) (ModelCapabilities, bool)
 
 // [RC-2] GetModelUsage 已移除: /managed-models/usage 端点已迁移至 tk-dist 营销系统
 
-// getCachedModel 从缓存中查找完整 ManagedModel (线程安全)
-// 未命中时返回仅含 Provider 的占位值, 保证 getAdapterForModel 能回落 provider 硬编码
-func (c *Client) getCachedModel(modelID string) ManagedModel {
+// getCachedModel 从缓存中查找完整 ManagedModel (线程安全)。
+// 未命中时返回 (零值, false), 不再硬编码 anthropic 占位。
+// 调用方应用 ensureModelCached 触发 ListModels 刷新后再查。
+func (c *Client) getCachedModel(modelID string) (ManagedModel, bool) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	for _, m := range c.modelCache {
 		if m.ID == modelID || m.ModelID == modelID {
-			return m
+			return m, true
 		}
 	}
-	return ManagedModel{Provider: "anthropic"}
+	return ManagedModel{}, false
+}
+
+// primeModelCacheForTest 测试辅助: 把占位 ManagedModel 塞入缓存, 避免测试触发 ListModels。
+// 仅同包 (测试) 调用, 不暴露给 SDK 使用者。非测试代码请走 ListModels。
+func (c *Client) primeModelCacheForTest(ids ...string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, id := range ids {
+		c.modelCache = append(c.modelCache, ManagedModel{
+			ID:       id,
+			ModelID:  id,
+			Provider: "anthropic", // 测试默认 anthropic 格式 (保持历史行为)
+		})
+	}
+	c.modelCacheTime = time.Now()
+}
+
+// ensureModelCached 确保指定 modelID 的 ManagedModel 已在缓存中。
+//
+// 语义:
+//  1. 若缓存命中 → 直接返回
+//  2. 若未命中 → 调 ListModels(ctx) 刷新一次
+//  3. 刷新后仍未命中 → 返回 *ModelNotFoundError
+//
+// 根因修复 (Finding 2): 消除未预热场景下 Provider="anthropic" 硬编码回退,
+// 该回退会让 DashScope/Zhipu/DeepSeek 等 non-anthropic 模型被按 Anthropic
+// 格式编码并打到错误的 /anthropic 端点。
+//
+// 幂等: 并发调用安全 (ListModels 内部有写锁; 同 modelID 可能产生多次刷新,
+// 但不会破坏状态, 且首次刷新后后续调用立即命中)。
+func (c *Client) ensureModelCached(ctx context.Context, modelID string) (ManagedModel, error) {
+	if m, ok := c.getCachedModel(modelID); ok {
+		return m, nil
+	}
+	// 未命中 — 刷新一次
+	if _, err := c.ListModels(ctx); err != nil {
+		return ManagedModel{}, fmt.Errorf("ensure model cached: refresh list failed: %w", err)
+	}
+	if m, ok := c.getCachedModel(modelID); ok {
+		return m, nil
+	}
+	return ManagedModel{}, &ModelNotFoundError{ModelID: modelID}
 }
 
 // buildChatRequest 构建完整的聊天请求体（v0.5.0 adapter 模式）
@@ -393,14 +436,20 @@ func (c *Client) getCachedModel(modelID string) ManagedModel {
 // Anthropic provider → AnthropicAdapter（含 betas/ServerTools）
 // 其他 provider     → OpenAIAdapter（无 betas，扩展字段透传）
 //
+// v0.13.x: 前置 ensureModelCached, 消除冷缓存硬编码回退。未知 modelID 返回 *ModelNotFoundError。
+//
 // 返回: (请求体 JSON, 使用的 adapter, 错误)
-func (c *Client) buildChatRequest(modelID string, req *ChatRequest) ([]byte, ProviderAdapter, error) {
+func (c *Client) buildChatRequest(ctx context.Context, modelID string, req *ChatRequest) ([]byte, ProviderAdapter, error) {
 	// v0.11.0: 请求前防御 (体积 / deny-list / 深度 / ephemeral 剥离)。未配置时零开销。
 	if err := c.applyRequestSanitizers(req); err != nil {
 		return nil, nil, err
 	}
 
-	adapter := getAdapterForModel(c.getCachedModel(modelID))
+	m, err := c.ensureModelCached(ctx, modelID)
+	if err != nil {
+		return nil, nil, err
+	}
+	adapter := getAdapterForModel(m)
 	caps, _ := c.getCachedCapabilities(modelID)
 
 	body, err := adapter.BuildRequestBody(caps, req)
@@ -425,7 +474,7 @@ func (c *Client) Chat(ctx context.Context, modelID string, req ChatRequest) (*Ch
 	}
 
 	// 使用 adapter 构建请求
-	body, adapter, err := c.buildChatRequest(modelID, &req)
+	body, adapter, err := c.buildChatRequest(ctx, modelID, &req)
 	if err != nil {
 		return nil, fmt.Errorf("build chat request: %w", err)
 	}
@@ -463,8 +512,13 @@ func (c *Client) Chat(ctx context.Context, modelID string, req ChatRequest) (*Ch
 // v0.5.0: 根据 provider 自动路由
 //   Anthropic → chatMessagesAnthropic（现有路径，POST /anthropic）
 //   其他厂商 → chatMessagesOpenAI（POST /chat，响应转换为 AnthropicResponse）
+// v0.13.x: 前置 ensureModelCached, 消除冷缓存硬编码回退。未知 modelID 返回 *ModelNotFoundError。
 func (c *Client) ChatMessages(ctx context.Context, modelID string, req ChatRequest) (*AnthropicResponse, error) {
-	adapter := getAdapterForModel(c.getCachedModel(modelID))
+	m, err := c.ensureModelCached(ctx, modelID)
+	if err != nil {
+		return nil, err
+	}
+	adapter := getAdapterForModel(m)
 
 	if adapter.Format() == FormatAnthropic {
 		return c.chatMessagesAnthropic(ctx, modelID, req, adapter)
@@ -580,7 +634,7 @@ func (c *Client) chatMessagesStreamInternal(ctx context.Context, modelID string,
 	eventCh chan<- StreamEvent, errCh chan<- error, retried bool) {
 
 	req.Stream = true
-	body, adapter, buildErr := c.buildChatRequest(modelID, &req)
+	body, adapter, buildErr := c.buildChatRequest(ctx, modelID, &req)
 	if buildErr != nil {
 		errCh <- buildErr
 		return
@@ -708,7 +762,7 @@ func (c *Client) chatStreamInternal(ctx context.Context, modelID string, req Cha
 	eventCh chan<- StreamEvent, errCh chan<- error, retried bool) {
 
 	req.Stream = true
-	body, adapter, buildErr := c.buildChatRequest(modelID, &req)
+	body, adapter, buildErr := c.buildChatRequest(ctx, modelID, &req)
 	if buildErr != nil {
 		errCh <- buildErr
 		return

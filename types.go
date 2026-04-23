@@ -883,6 +883,21 @@ func (e *OrderTerminalError) Error() string {
 	return fmt.Sprintf("order %s terminated: %s", e.OrderID, e.Status)
 }
 
+// ModelNotFoundError 模型缓存未命中且 ListModels 刷新后仍未找到。
+//
+// 历史上 getCachedModel miss 时硬返 ManagedModel{Provider:"anthropic"} 占位,
+// 导致未预热场景下的 Chat 请求按 AnthropicAdapter 编码, 被发到错误端点。
+// v0.13.x 改为 miss → ListModels 自动刷新一次; 仍 miss → 返回此错误。
+//
+// 调用方: 要么在 Login 后显式 ListModels 预热, 要么捕获本错误做重试/降级。
+type ModelNotFoundError struct {
+	ModelID string
+}
+
+func (e *ModelNotFoundError) Error() string {
+	return fmt.Sprintf("managed model %q not found (list models to refresh cache, or verify model id)", e.ModelID)
+}
+
 // businessCodeChecker 内部接口, doJSON/doPublicJSON 解码后检查业务错误码
 type businessCodeChecker interface {
 	businessError() error

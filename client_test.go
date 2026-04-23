@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -529,5 +530,185 @@ func TestPurchaseChain_EndToEnd(t *testing.T) {
 	}
 	if bal.ActiveEntitlements != 1 {
 		t.Errorf("expected 1 active entitlement, got %d", bal.ActiveEntitlements)
+	}
+}
+
+// ============================================================================
+// Phase 2: SDK 冷缓存根因修复测试
+// 验证:
+//   - ensureModelCached miss → 自动调 ListModels 刷新一次
+//   - 刷新后命中 → 返回正确 ManagedModel (非硬编码 anthropic)
+//   - 刷新后仍 miss → 返回 *ModelNotFoundError
+//   - buildChatRequest / ChatMessages 均走 ensureModelCached
+// ============================================================================
+
+func TestPhase2_EnsureModelCached_AutoRefreshOnMiss(t *testing.T) {
+	var listHits int32
+	var chatPath string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/managed-models") {
+			atomic.AddInt32(&listHits, 1)
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(APIResponse[[]ManagedModel]{
+				Code: 0,
+				Data: []ManagedModel{
+					{ID: "real-model", ModelID: "real-model", Provider: "dashscope", PreferredFormat: "anthropic"},
+				},
+			})
+			return
+		}
+		chatPath = r.URL.Path
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"id":          "msg_test",
+			"type":        "message",
+			"role":        "assistant",
+			"model":       "real-model",
+			"content":     []any{map[string]any{"type": "text", "text": "ok"}},
+			"stop_reason": "end_turn",
+			"usage":       map[string]any{"input_tokens": 1, "output_tokens": 1},
+		})
+	}))
+	defer srv.Close()
+
+	// 不预填缓存 — 验证 Chat 触发一次 ListModels
+	c := testClient(t, srv.URL)
+
+	_, err := c.Chat(context.Background(), "real-model", ChatRequest{
+		Messages: []ChatMessage{{Role: "user", Content: "hi"}},
+	})
+	if err != nil {
+		t.Fatalf("Chat failed: %v", err)
+	}
+
+	// 必须至少一次 ListModels (ensureModelCached miss 触发)
+	if got := atomic.LoadInt32(&listHits); got < 1 {
+		t.Errorf("expected at least 1 ListModels call on cache miss, got %d", got)
+	}
+	// preferred_format=anthropic 应选 AnthropicAdapter → 路由到 /anthropic
+	if !strings.HasSuffix(chatPath, "/real-model/anthropic") {
+		t.Errorf("preferred_format=anthropic 应路由到 /anthropic, got path=%s", chatPath)
+	}
+}
+
+func TestPhase2_EnsureModelCached_NotFound(t *testing.T) {
+	// ListModels 返回空列表
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/managed-models") {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(APIResponse[[]ManagedModel]{Code: 0, Data: []ManagedModel{}})
+			return
+		}
+		t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+	}))
+	defer srv.Close()
+
+	c := testClient(t, srv.URL)
+
+	_, err := c.Chat(context.Background(), "nonexistent", ChatRequest{
+		Messages: []ChatMessage{{Role: "user", Content: "hi"}},
+	})
+	if err == nil {
+		t.Fatal("expected ModelNotFoundError, got nil")
+	}
+	var mnf *ModelNotFoundError
+	if !errors.As(err, &mnf) {
+		t.Fatalf("expected *ModelNotFoundError, got %T: %v", err, err)
+	}
+	if mnf.ModelID != "nonexistent" {
+		t.Errorf("ModelID=%q, want %q", mnf.ModelID, "nonexistent")
+	}
+}
+
+func TestPhase2_EnsureModelCached_WarmCache_NoRefresh(t *testing.T) {
+	var listHits int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/managed-models") {
+			atomic.AddInt32(&listHits, 1)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"id": "msg_x", "type": "message", "role": "assistant",
+			"content": []any{map[string]any{"type": "text", "text": "ok"}},
+			"usage":   map[string]any{"input_tokens": 1, "output_tokens": 1},
+		})
+	}))
+	defer srv.Close()
+
+	c := testClient(t, srv.URL)
+	c.primeModelCacheForTest("warm-model") // 预热
+
+	for i := 0; i < 3; i++ {
+		_, err := c.Chat(context.Background(), "warm-model", ChatRequest{
+			Messages: []ChatMessage{{Role: "user", Content: "hi"}},
+		})
+		if err != nil {
+			t.Fatalf("Chat #%d failed: %v", i, err)
+		}
+	}
+
+	if got := atomic.LoadInt32(&listHits); got != 0 {
+		t.Errorf("warm cache 不应触发 ListModels, got %d hits", got)
+	}
+}
+
+// 验证历史 bug 根因: 无缓存场景下不会硬编码 anthropic 回退到错误端点
+func TestPhase2_NoAnthropicHardcodedFallback(t *testing.T) {
+	var paths []string
+	var pathsMu sync.Mutex
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		pathsMu.Lock()
+		paths = append(paths, r.URL.Path)
+		pathsMu.Unlock()
+
+		if r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/managed-models") {
+			w.Header().Set("Content-Type", "application/json")
+			// 真实 provider 是 openai, preferred_format=openai → 必须走 /chat 端点
+			_ = json.NewEncoder(w).Encode(APIResponse[[]ManagedModel]{
+				Code: 0,
+				Data: []ManagedModel{
+					{ID: "gpt4", ModelID: "gpt4", Provider: "openai", PreferredFormat: "openai",
+						SupportedFormats: []string{"openai"}},
+				},
+			})
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		// 返回 OpenAI 格式响应
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"id":      "chatcmpl",
+			"object":  "chat.completion",
+			"model":   "gpt4",
+			"choices": []any{map[string]any{"message": map[string]any{"role": "assistant", "content": "ok"}, "finish_reason": "stop"}},
+			"usage":   map[string]any{"prompt_tokens": 1, "completion_tokens": 1},
+		})
+	}))
+	defer srv.Close()
+
+	c := testClient(t, srv.URL) // 冷缓存
+	_, err := c.Chat(context.Background(), "gpt4", ChatRequest{
+		Messages: []ChatMessage{{Role: "user", Content: "hi"}},
+	})
+	if err != nil {
+		t.Fatalf("Chat failed: %v", err)
+	}
+
+	pathsMu.Lock()
+	defer pathsMu.Unlock()
+	// 断言: 请求路径集合中必须含 /chat, 不能含 /anthropic
+	var hasChat, hasAnthropic bool
+	for _, p := range paths {
+		if strings.HasSuffix(p, "/gpt4/chat") {
+			hasChat = true
+		}
+		if strings.HasSuffix(p, "/gpt4/anthropic") {
+			hasAnthropic = true
+		}
+	}
+	if !hasChat {
+		t.Errorf("openai provider 必须路由到 /chat, paths=%v", paths)
+	}
+	if hasAnthropic {
+		t.Errorf("历史 bug 回归: openai provider 被错误路由到 /anthropic (硬编码回退), paths=%v", paths)
 	}
 }

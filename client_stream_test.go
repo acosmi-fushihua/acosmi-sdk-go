@@ -38,7 +38,8 @@ func (m *memStore) Clear() error {
 }
 
 // newTestClient 构造指向 httptest server 的 Client, token 永不过期。
-func newTestClient(t *testing.T, serverURL string) *Client {
+// v0.13.x: 可传入 primeModelIDs 预先填充模型缓存, 避免 Chat/ChatMessages* 触发 ListModels。
+func newTestClient(t *testing.T, serverURL string, primeModelIDs ...string) *Client {
 	t.Helper()
 	tok := &TokenSet{
 		AccessToken:  "test-token",
@@ -53,6 +54,9 @@ func newTestClient(t *testing.T, serverURL string) *Client {
 	})
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
+	}
+	if len(primeModelIDs) > 0 {
+		c.primeModelCacheForTest(primeModelIDs...)
 	}
 	return c
 }
@@ -77,7 +81,7 @@ func TestChatMessagesStream_CtxCancelClosesChannels(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := newTestClient(t, srv.URL)
+	c := newTestClient(t, srv.URL, "m-1")
 	ctx, cancel := context.WithCancel(context.Background())
 	evCh, errCh := c.ChatMessagesStream(ctx, "m-1", ChatRequest{
 		RawMessages: []any{map[string]any{"role": "user", "content": "hi"}},
@@ -164,7 +168,11 @@ data: {"type":"message_stop"}
 	}))
 	defer srv.Close()
 
-	c := newTestClient(t, srv.URL)
+	modelIDs := make([]string, 0, 20)
+	for i := 0; i < 20; i++ {
+		modelIDs = append(modelIDs, fmt.Sprintf("m-%d", i))
+	}
+	c := newTestClient(t, srv.URL, modelIDs...)
 
 	const N = 20
 	var wg sync.WaitGroup
@@ -255,7 +263,7 @@ data: {"type":"message_stop"}
 	}))
 	defer srv.Close()
 
-	c := newTestClient(t, srv.URL)
+	c := newTestClient(t, srv.URL, "m-x")
 
 	const N = 10
 	var wg sync.WaitGroup

@@ -225,7 +225,9 @@ caps, _ := client.GetModelCapabilities(ctx, "claude-opus-4-6")
 // caps.SupportsThinking / SupportsWebSearch / SupportsFastMode / Supports1MContext ...
 ```
 
-内部复用 `ListModels` 缓存 (5min TTL)，建议启动时调用一次 `ListModels()` 预热。
+内部复用 `ListModels` 缓存 (5min TTL)。建议在应用启动或切换租户/环境后先调用一次 `ListModels()` 预热，确保模型能力与 `preferred_format` / `supported_formats` 路由信息已在本地缓存。
+
+> **v0.13.x 破坏性变更**: `Chat` / `ChatMessages` / `ChatStream` / `ChatMessagesStream` 在模型缓存未命中时会**自动触发一次 `ListModels()` 刷新**。若刷新后仍找不到该 modelID, 返回 `*ModelNotFoundError` 而非静默回退到 Anthropic 路由 (修复 F2 根因: 原硬编码 `Provider:"anthropic"` 占位导致 non-anthropic 模型被误发到 `/anthropic` 端点)。调用方可 `errors.As(err, &mnf)` 捕获。
 
 #### 同步聊天
 
@@ -401,22 +403,28 @@ SDK 通过 `getAdapterForModel(model)` 按以下**四层优先级**选择 adapte
 3. `model.SupportedFormats` 含 "anthropic" → AnthropicAdapter (否则 "openai" → OpenAIAdapter)
 4. 均为空 (旧 Gateway 未返回字段) → 回落 provider 硬编码: `{anthropic, acosmi}` → AnthropicAdapter, 其余 → OpenAIAdapter
 
-**上游默认**（Gateway v0.10.0+ 在 `/models` 响应里填充）:
+**上游默认**（Gateway v0.13.x 在 `/models` 响应里填充）:
 
 | Provider | supported_formats | preferred_format | 端点后缀 | Betas 注入 |
 |----------|------|------|------|------|
-| Anthropic | `["anthropic","openai"]` | `anthropic` | `/anthropic` | 是 (10 项) |
+| Anthropic | `["anthropic"]` | `anthropic` | `/anthropic` | 是 (10 项) |
 | Acosmi | 同 Anthropic (hardcode 回落) | — | `/anthropic` | 是 |
-| DashScope (Qwen) | `["anthropic","openai"]` | `anthropic` | **`/anthropic`** ⚠️ v0.10.0 起改从 `/chat` 切换 | 是 |
-| Zhipu (GLM) | `["anthropic","openai"]` | `anthropic` | **`/anthropic`** ⚠️ | 是 |
-| DeepSeek | `["anthropic","openai"]` | `anthropic` | **`/anthropic`** ⚠️ | 是 |
+| DashScope (Qwen) | `["anthropic","openai"]` | `anthropic` | **`/anthropic`** | 是 |
+| Zhipu (GLM) | `["anthropic","openai"]` | `anthropic` | **`/anthropic`** | 是 |
+| DeepSeek | `["anthropic","openai"]` | `anthropic` | **`/anthropic`** | 是 |
 | OpenAI | `["openai"]` | `openai` | `/chat` | 否 |
 | VolcEngine (豆包) | `["openai"]` | `openai` | `/chat` | 否 |
 | Custom | `["openai"]` | `openai` | `/chat` | 否 |
 
-> **⚠️ 破坏性变更 (v0.10.0)**: DashScope / Zhipu / DeepSeek 默认切到 Anthropic 协议端点 — 这三家 Gateway 侧本就内置 Anthropic 兼容端点, 但 v0.9.x 及以前 SDK 按 provider 名硬编码走 `/chat`, 导致 `tool_reference` 等 Anthropic 专属 content block 被 Rust gateway 严格校验 400 拒绝。若需保留旧行为, 手动在 `ManagedModel.PreferredFormat` 置 `"openai"` 或 Gateway 侧只返回 `supported_formats: ["openai"]`。
+> **⚠️ 破坏性变更 (v0.13.x, Gateway Phase 3 诚实化)**: `Anthropic` provider 从 `["anthropic","openai"]` 收紧到 `["anthropic"]`。原声明 OpenAI 格式属声明-行为漂移: `/chat` 主链路对 Anthropic provider 仅做 Anthropic body 适配, 无 OpenAI→Anthropic 消息转换, 强行声明会误导调用方。若需对接 Anthropic 模型, 必须使用 `ChatMessages` / `ChatMessagesStream` (走 `/anthropic` 端点)。
+>
+> **ℹ️ 旧行为提示 (v0.10.0 切换记录)**: DashScope / Zhipu / DeepSeek 在 v0.10.0 起从 `/chat` 默认切到 Anthropic 协议端点 (这三家 Gateway 侧本就内置 Anthropic 兼容端点)。若需保留 `/chat` 路径, 在 Gateway 侧配置 `preferred_format: "openai"`。
 
-> 注: OpenAIAdapter 不注入 Anthropic betas，扩展字段 (thinking/effort/speed) 以通用 JSON 透传给 Nexus Gateway，由 Gateway per-provider adapter 转换为厂商格式。
+> 注: OpenAIAdapter 不注入 Anthropic betas。OpenAI 路由会把 `Effort` / `Thinking.Level`、`OutputConfig`、`ParallelToolCalls` 映射到 OpenAI 顶层字段；其余特殊字段可通过 `ExtraBody` 显式透传。
+>
+> **Gateway v0.13.x 字段落地**: `/chat` 主链路现已接入 `reasoning_effort` / `response_format` / `parallel_tool_calls` / `extra_body` 4 个 OpenAI wire-format 字段 (修复 F1 根因: 原 `ChatProxyRequest` 绑定结构缺字段导致静默丢失)。`extra_body` 走严格白名单: `frequency_penalty` / `presence_penalty` / `seed` / `user` / `logit_bias` / `stop` / `top_k` / `n` / `logprobs` / `top_logprobs`, 非白名单 key 会被拒绝并记 `gateway.extra_body.rejected` warn 日志。
+>
+> **ExtraBody 扁平化 (A-01 审计修复)**: SDK `ExtraBody` 按 OpenAI Python SDK 约定直接合入请求体顶层 (`body["seed"]=42` 而非 `body["extra_body"]["seed"]=42`)。Gateway 在 handler 层用 `PromoteOpenAIExtraFromFlat` 从原始 JSON 提取白名单顶层键再合入 `req.ExtraBody`, 全程**无需调用方改写**。双保险: 若你显式使用嵌套 `extra_body: {...}`, Gateway 也会保留该嵌套值优先 (显式 > 隐式)。
 
 #### 扩展字段 (CrabCode)
 
@@ -440,6 +448,19 @@ resp, _ := client.Chat(ctx, modelID, acosmi.ChatRequest{
 ```
 
 > 扩展字段标记 `json:"-"`，仅通过内部 `buildChatRequest` 序列化。
+
+#### OpenAI 兼容字段映射 (v0.13.0)
+
+当模型被路由到 OpenAI 兼容格式时，SDK 会优先按 OpenAI wire format 直接翻译关键字段：
+
+| SDK 字段 | OpenAI 顶层字段 | 说明 |
+|------|------|------|
+| `Effort.Level` / `Thinking.Level` | `reasoning_effort` | `max` 会降级为 `high`；`Effort` 优先级高于 `Thinking.Level` |
+| `OutputConfig` | `response_format` | `json_schema` 会生成 `{type:"json_schema", json_schema:{schema,strict:true}}` |
+| `ParallelToolCalls` | `parallel_tool_calls` | OpenAI 专属；Anthropic 路由忽略 |
+| `ExtraBody` | 同名字段直接透传 | 在最后合入，若与 SDK 已生成字段同名，会覆盖 SDK 值 |
+
+这意味着 v0.13.0 起，OpenAI 路由默认不再发送裸 `thinking` / `effort` / `output_config` 字段；若确实需要保留旧透传语义，请显式使用 `ExtraBody`。
 
 #### 联网搜索 (Server Tool)
 
@@ -827,6 +848,7 @@ type ChatRequest struct {
     Speed        string                 // "" | "fast"
     Effort       *EffortConfig
     OutputConfig *OutputConfig
+    ParallelToolCalls *bool             // v0.13.0: OpenAI 顶层 parallel_tool_calls
     ExtraBody    map[string]interface{} // 透传任意字段
 }
 
@@ -1329,6 +1351,29 @@ func main() {
 
 Token 文件: 目录 `0700`，文件 `0600`。下载限制 50MB。
 
+### 请求前防御与 Ephemeral 历史剥离
+
+如果你的上层会回放多轮历史，推荐同时启用底线防御和自动剥离 ephemeral 历史：
+
+```go
+import "github.com/acosmi/acosmi-sdk-go/sanitize"
+
+client.SetDefensiveSanitize(sanitize.MinimalSanitizeConfig{
+    MaxImageBytes:    5 * 1024 * 1024,
+    MaxVideoBytes:    50 * 1024 * 1024,
+    MaxPDFBytes:      10 * 1024 * 1024,
+    MaxMessagesTurns: 100,
+})
+client.SetAutoStripEphemeralHistory(true)
+```
+
+关键行为：
+
+- `SetDefensiveSanitize(...)` 会在 `Chat` / `ChatStream` / `ChatMessages*` 发送前执行底线检查，提前拦截超大 base64、多轮历史过深、永久禁止 block 等问题。
+- `SetAutoStripEphemeralHistory(true)` 会在历史回放前自动剥离被网关标记为 `acosmi_ephemeral:true` 的 block，典型包括 `thinking`、`redacted_thinking`、部分 server tool block。
+- 该标记是 in-band 协议：网关直接在 `content_block_start.content_block` 里注入 `acosmi_ephemeral:true`，SDK 不需要维护额外状态。
+- 零值兼容旧行为：未开启时不会改变现有请求路径或序列化结果。
+
 ---
 
 ## 9. 项目结构
@@ -1389,267 +1434,64 @@ make install    # → $GOPATH/bin
 
 ## 12. 版本记录
 
-### v0.13.2 (2026-04-22) — 网关侧 Anthropic 端点漂移根治 (docs-only)
+> 本节只保留 SDK 使用者最需要关心的兼容点与破坏性变更。更细的网关实现背景、审计过程和分阶段交付记录，建议查主仓架构文档。
 
-SDK 代码无改动, 仅文档。对应网关侧 commit `refactor(gateway): Anthropic 端点统一读 capability preset — 删双表根治漂移` (42ca1e51)。
+### v0.13.2 / v0.13.1 (2026-04-22)
 
-背景:
-commit 608da8bd (2026-04-10) 在 `service/model_gateway.go` 建 `providerAnthropicEndpoints` 副表时, DashScope/Zhipu/DeepSeek 三条漏写 `/v1/messages`; 而 `ChatStream/ChatSync` 对 Anthropic 路由约定"端点已包含完整路径, 不拼接后缀" → Anthropic 格式请求被直送裸路径 → 上游 400 `Request body format invalid`。
+- SDK 公共 API 无新增；主要是文档和关联网关能力对齐。
+- Anthropic 路由的上游端点统一以 capability preset 为单一来源，避免 `/v1/messages` 漂移。
+- Zhipu 补齐 Anthropic preset 后，可与 DashScope / DeepSeek 一样稳定走 `/anthropic` 管线。
+- `SetAutoStripEphemeralHistory(true)` 所依赖的 in-band `acosmi_ephemeral` 标记链路已完整可用。
 
-根因定性:
-副表与 `capability/presets/*.go` 是两套独立端点声明 (spec v2 §2 明确 preset 为 SSOT), 前者漂移即引故障。过去多次补这张副表的值是在补副本, 而非消除冗余。
+### v0.13.0 (2026-04-22)
 
-根因修复:
-- **删 `providerAnthropicEndpoints`**: `ResolveEndpoint` 对 Anthropic 路由直接读 `capability.Lookup(provider).UpstreamBaseURL + UpstreamPath`, 信息只剩 preset 一份, 不可能再漂移。
-- **删隐式后缀拼接**: 上一轮 "normalize auto-append /v1/messages" 本身亦是补丁。`customEndpoint` 非空时字面用 (仅去尾 /), admin 自行负责完整性; 留空则 preset 保证对。
-- **新增 `capability.Zhipu` + `presets/zhipu.go`**: 过去 `Lookup("zhipu")` 返回 nil 导致 Anthropic 路由沿 OpenAI 端点回落, 现在 Zhipu 正常走 Anthropic 管线 (含 sanitize / ephemeral 注入 / 白名单过滤全套 spec v2 能力)。
-- **init() 交叉校验**: `model.SupportedAnthropicFormatProviders()` 中每个 provider 必须有 preset 且 `WireFormat=FormatAnthropicMessages`, 否则启动期 panic; 声明与 preset 不一致时立即暴露。
-- **契约单测**: `TestGateway_ResolveEndpoint_AnthropicFormat_FromPreset` 锁定 4 个 Anthropic-兼容 provider 解析产出完整 `…/v1/messages` URL, 未来漂移 CI 即红。
+- OpenAI 路由补齐 3 个关键字段映射：`reasoning_effort`、`response_format`、`parallel_tool_calls`。
+- `ChatRequest` 新增 `ParallelToolCalls *bool`。
+- 轻微兼容变更：OpenAI 路由不再默认发送裸 `thinking` / `effort` / `output_config`，如需旧透传语义请改用 `ExtraBody`。
+- 相关说明见 §4.3 “OpenAI 兼容字段映射” 与 §6 `ChatRequest`。
 
-对 SDK 用户的影响:
-- Zhipu 走 Anthropic 格式现在可用 (过去隐性回落 OpenAI, spec v2 能力链路缺失)。
-- DashScope / DeepSeek / Anthropic 原生 Anthropic 格式无需 admin 再手动在后台填完整 URL, 留空即正确。
-- 自定义 endpoint 行为变更 (轻微 Breaking): 过去无隐式后缀拼接, 本次重申此语义; 若此前依赖填 base URL 再被拼接 → 需要管理员补完。
+### v0.11.0 (2026-04-22)
 
-### v0.13.1 (2026-04-22) — 网关侧 spec v2 §3-§8 全量交付 (docs-only)
+- 新增 `sanitize` 子包。
+- `Client` 新增 `SetDefensiveSanitize(...)` 与 `SetAutoStripEphemeralHistory(bool)` 两个钩子。
+- `StreamEvent` 新增 block 元数据：`BlockIndex` / `BlockType` / `Ephemeral`。
+- 相关说明见 §8 “请求前防御与 Ephemeral 历史剥离”。
 
-SDK 代码无改动, 仅文档与状态更新。对应网关侧 commit 参见 Chat-Acosmi 主仓
-`feat(gateway): spec v2 §3-§8 网关侧全量实施 (7 Phase)` (49ce9e54+)。
+### v0.10.0 (2026-04-22) ⚠️ 破坏性
 
-- **网关侧 7 Phase 完成** (内部版本, 无外部 tag):
-  - **G1**: `ProviderCapability` 子包 + 6 preset (anthropic-official / aliyun-dashscope / openrouter / deepseek / third-party-default / openai-compat)
-  - **G2**: 13 步 Sanitizer 流水 (block 白名单 / cache_control / system 降级 / 顶层字段剥 / betas body↔header / tool 字段白名单 / tool_choice 校验 / tool_result.is_error 剥 / max_tokens 夹紧 / stop_sequences 截断 / 多模态校验)
-  - **G3**: wire format 双向转换 (system 位置 / tool_use↔tool_calls / image base64↔data URI / stop_reason 值空间 / reasoning_content→thinking block)
-  - **G4**: 响应侧 **in-band `acosmi_ephemeral`** 注入 (spec v2 根因方案) + AllowedResponseBlocks 白名单 (未知 block 三联丢弃)
-  - **G5**: Server Tool 降级 (`web_search` 改写 client tool schema + SSE index 单调偏移合并两轮)
-  - **G6**: 错误分类 (`GatewayError.Kind` = `arrearage/invalid_request/authentication/rate_limit/server/overloaded`) + Retry-After 三形态解析
-  - **G7**: 接入 `ChatStream/ChatSync` 主流程 + 53 单测 全 `-race` PASS
-- **效果**: SDK v0.11.0 引入的 `SetAutoStripEphemeralHistory(true)` 现已**完全工作** —— 网关在 Anthropic 响应链路的 `content_block_start.content_block` 注入 `acosmi_ephemeral:true` 标记 thinking / redacted_thinking / server_tool_use 等 block, 下一轮 SDK 自动剥除
-- **根因闭环**: 2026-04-22 产线 `tool_reference 400` 故障从 SDK 路由 + 网关 sanitize 双侧杜绝 (R-1 regression 通过)
-- **向后兼容**: 未登记 preset 的 provider 在网关侧回落到现 `adapt*` 逻辑; OpenAI 路径 (`/chat`) 不经过 sanitize, 保留 DashScope `enable_thinking` / VolcEngine `plugins.web_search` 等已有特殊适配
-- **交叉复核修复 4 项** (代码层审计产出, 已回归验证):
-  - `openai-compat` preset `SupportsThinkingRequest` 由 true 改 false (避免绕过 SDK 的 raw thinking 字段透给 OpenAI 上游 400)
-  - `stringifyArguments(map)` 用 `encoding/json` 而非 `fmt.Sprintf("%v")` (原实现产出 Go map 表示非 JSON, OpenAI 解析 arguments 失败)
-  - `parseArguments(string)` 用 `json.Unmarshal` 解到 map (原实现原样返字符串, Anthropic `tool_use.input` 规范要求 object)
-  - `transformer.handleBlockStart` content_block.type 缺失时保守透传 (原实现 fallback 到顶层 "content_block_start" 被当未知 block 误丢)
+- Adapter 选择从“硬编码 provider”切换为“优先读取 `PreferredFormat` / `SupportedFormats`”。
+- DashScope / Zhipu / DeepSeek 在上游声明 `preferred_format: "anthropic"` 时，会从 `/chat` 切到 `/anthropic`。
+- 旧 Gateway 未返回这两个字段时，SDK 仍按历史 provider 规则回退，保持向后兼容。
+- 相关说明见 §4.3 “Anthropic 原生格式 — ChatMessages (V8)”。
 
-### v0.13.0 (2026-04-22) — OpenAI 格式翻译覆盖扩充 + 完整测试矩阵
+### v0.9.0 / v0.8.0
 
-在 v0.11.0 基础上, 按 2026-04-22 spec v2 §7 把 v0.11+v0.12+v0.13 的 SDK scope 一次性发全。
+- 新增三档 `Thinking Level` API：`off` / `high` / `max`。
+- `Level` 非空时，SDK 自动组装 `thinking` + `effort` + `max_tokens`；`Level=""` 时保持 v0.8.0 passthrough 兼容语义。
+- 相关说明见 §4.3 “思考级别 (Thinking Level)”。
 
-- **feat(adapter_openai)**: Anthropic 心智模型 → OpenAI wire format 翻译扩充 3 项
-  - **reasoning_effort** — 从 `Effort.Level` 直接映射 `low/medium/high`; `max` 在 OpenAI 无对应, 退到 `high`。`Thinking.Level` 作次优先级 (`ThinkingHigh/ThinkingMax` → `high`, `ThinkingOff` → 不设)。`Effort` 覆盖 `Thinking`
-  - **response_format** — `OutputConfig.Format = "json_schema"` → `{type:"json_schema", json_schema:{schema,strict:true}}`; `"json_object"` → `{type:"json_object"}`; 未识别的 format 原样透传 (交 Gateway)
-  - **parallel_tool_calls** — `ChatRequest` 新增 `ParallelToolCalls *bool` 字段; `AnthropicAdapter` 忽略(OpenAI 专属)
-- **breaking (minor)**: `OpenAIAdapter.BuildRequestBody` 不再写 `body["thinking"]`/`body["effort"]`/`body["output_config"]` 裸字段; 改为按 OpenAI 规范翻译。若旧代码依赖这三个裸字段透传, 请用 `ExtraBody` 显式注入
-- **test**: +26 单测, 全量 50 单测 + 1 fuzz (2.5M execs 无 panic) 覆盖 S-1~S-15 (除 S-11 物理不可达)
-  - `adapter_openai_test.go` (15) — reasoning_effort 三源 + response_format 四形态 + parallel_tool_calls 三分支 + ExtraBody 两 adapter 透传 + 覆盖同名字段
-  - `client_stream_test.go` (3) — S-10 ctx cancel 关闭 channel / S-12 并发 ChatMessagesStream / S-12 变体并发 blockTypeMap 隔离
-  - `sanitize_bridge_test.go` (+2) — S-8 AutoStrip 默认 off / 显式 off
-- **ci**: 全量测试加 `-race`, 并发隔离验证
+### v0.6.0 (2026-04-13)
 
-### v0.11.0 (2026-04-22) — Sanitize 包 + StreamEvent Block 元数据 + in-band Ephemeral
+- 新增通知管理、设备注册、通知偏好相关 API 和类型。
+- 相关说明见 §4.8 ~ §4.11 与 §6 “通知”。
 
-全新增字段 / 枚举, 零值等价 v0.10.0 行为, 未接入的消费者无感。
+### v0.5.0 (2026-04-11)
 
-- **feat(sanitize)**: 新增 `github.com/acosmi/acosmi-sdk-go/sanitize` 子包
-  - `BlockType` 枚举 (16 种 content block 类型, 覆盖 Anthropic 请求/响应 + ephemeral)
-  - `DeltaType` 枚举 (text_delta / input_json_delta / thinking_delta / signature_delta / citations_delta)
-  - `MinimalSanitizeConfig` — 底线防御配置 (base64 体积上限 + history 深度上限 + `PermanentDenyBlocks` 黑名单)
-  - `Sanitize(messages, cfg) ([]any, error)` — 早失败式体积校验 + deny-list 剥除 + tool_use_id 联动剥 tool_result
-  - `StripEphemeral(messages) []any` — 按 in-band `acosmi_ephemeral:true` 标记剥历史, 联动剥对应 tool_result
-  - `EphemeralMarkerField = "acosmi_ephemeral"` — 网关/消费者共享的标记字段名常量
-- **feat(client)**: 两个 Client 级钩子, 未配置时零开销
-  - `SetDefensiveSanitize(cfg sanitize.MinimalSanitizeConfig)` — 每次 Chat/ChatStream/ChatMessages* 请求前执行
-  - `SetAutoStripEphemeralHistory(on bool)` — 开启后自动扫 `RawMessages` 剥 ephemeral block
-- **feat(types)**: `StreamEvent` 新增 3 个 `json:"-"` 字段 (零值兼容)
-  - `BlockIndex int` — 对齐 Anthropic `content_block_*` 的 index
-  - `BlockType string` — 从 `content_block_start.content_block.type` 解出, delta/stop 查 map 继承
-  - `Ephemeral bool` — 从 `content_block_start.content_block.acosmi_ephemeral` in-band 字段解出
-- **feat(stream)**: Anthropic SSE 循环维护 `blockTypeMap[index] → meta`, 单 goroutine 无锁
-  - 零额外缓冲: in-band 标记随 `content_block_start` JSON 同步到达, 不需要独立 SSE meta 事件, 无顺序依赖
-  - 零延迟: 标记解析与原事件透传同一 tick
-  - `content_block_stop` 后删表项, 长流无累积
-- **compat**: 所有新字段零值等价旧行为; `Sanitize` 未调用时 `buildChatRequest` 完全跳过新路径; v0.10.0 消费者零改动升级
-- **test**: +24 单测 + 1 fuzz, 2.5M 次无 panic
-  - `sanitize/defensive_test.go` — S-1/S-2/S-3/S-9 (体积/deny/深度 + data URL 前缀兜底 + URL 源跳过)
-  - `sanitize/history_test.go` — StripEphemeral + H-2 tool_use_id 联动 + 零拷贝 + malformed 不 panic
-  - `sanitize/fuzz_test.go` — S-15 喂任意 JSON, 覆盖 255 个 interesting input
-  - `stream_meta_test.go` — S-4/S-5 (index/type/ephemeral 映射, delta/stop 继承, 非 block 事件不污染)
-  - `sanitize_bridge_test.go` — Messages/RawMessages 两分支深度校验 + struct 切片归一化 + 零配置 no-op
+- 引入 `ProviderAdapter`，形成 Anthropic / OpenAI 两条主路由。
+- `Chat` / `ChatStream` / `ChatMessages` / `ChatMessagesStream` 开始按 provider 自动切换端点和格式。
+- OpenAI SSE → Anthropic 事件转换、自定义响应转换也在这一版引入。
 
-#### 使用示例
+### v0.4.1 / v0.4.0 (2026-04-10)
 
-```go
-import "github.com/acosmi/acosmi-sdk-go/sanitize"
+- 引入 Anthropic 原生接口：`ChatMessages()` / `ChatMessagesStream()`。
+- `ChatResponse` 统一成 Anthropic content block 形态，消费方不再需要区分 OpenAI / Anthropic 响应结构。
+- 错误解析、betas 传递、Anthropic usage/stop sequence 等基础契约在这一阶段补齐。
 
-client, _ := acosmi.NewClient(acosmi.Config{ServerURL: "https://acosmi.com"})
+### v0.3.x / v0.2.x / v0.1.0
 
-// 启用底线防御 (可选, 按需配置)
-client.SetDefensiveSanitize(sanitize.MinimalSanitizeConfig{
-    MaxImageBytes:    5 * 1024 * 1024,   // 图片 ≤5MB 早失败
-    MaxVideoBytes:    50 * 1024 * 1024,
-    MaxPDFBytes:      10 * 1024 * 1024,
-    MaxMessagesTurns: 100,
-    // PermanentDenyBlocks 按需追加, 默认留空 (由网关决定)
-})
-
-// 开启自动剥离 ephemeral 历史 (网关 in-band 标记的 thinking / server_tool_use 等)
-client.SetAutoStripEphemeralHistory(true)
-
-// 流式消费示例: 使用 BlockType / Ephemeral 过滤 UI 展示
-for ev := range eventCh {
-    if ev.BlockType == string(sanitize.BlockThinking) && ev.Ephemeral {
-        // thinking 块, UI 可隐藏或折叠, 下一轮 SDK 自动不回传
-        continue
-    }
-    // ... 其他展示逻辑
-}
-```
-
-#### 与网关协议约定 (in-band ephemeral)
-
-网关在 `content_block_start` 的 JSON payload 里直接注入 `acosmi_ephemeral: true` 字段, 例如:
-
-```
-event: content_block_start
-data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","acosmi_ephemeral":true}}
-```
-
-选择 in-band 而非独立 `event: acosmi_meta` 事件的理由: **零缓冲 / 零顺序依赖 / 零延迟 / history 剥离天然可做** (消费者 history 中的 block 自带标记, SDK 无需另外记忆)。
-
-### v0.10.0 (2026-04-22) — Capability-driven Adapter 路由 ⚠️ 破坏性
-
-- **fix(adapter)**: 根因修复 CrabCode TUI 在 DashScope/Zhipu/DeepSeek 等 provider 使用 WebSearch + ToolSearch 时报 `HTTP 400: unknown variant tool_reference` 的问题
-  - 根因: v0.5.0 `getAdapter(provider string)` 按 provider 名硬编码, 非 `{anthropic, acosmi}` 的 provider 永远走 OpenAIAdapter → `/chat` 端点, 但 `tool_reference` 等 Anthropic 专属 content block 无法被 Rust gateway OpenAI 校验器接受
-- **feat(types)**: `ManagedModel` 新增两个字段 (上游 Gateway 在 `/models` 响应中填充)
-  - `SupportedFormats []string` — 上游启用的请求格式列表 (`"anthropic"` / `"openai"`)
-  - `PreferredFormat string` — 推荐客户端优先使用的格式
-  - 两字段均 `omitempty`, 旧 Gateway 未填时 SDK 回落 provider 硬编码 (向后兼容)
-- **feat(adapter)**: 新增 `getAdapterForModel(m ManagedModel)` 替代 `getAdapter(provider string)`
-  - 四层优先级: `PreferredFormat` → `SupportedFormats` → provider 硬编码回落
-  - 大小写不敏感 (`"Anthropic"` / `"ANTHROPIC"` 均有效)
-- **refactor(client)**: `buildChatRequest` / `ChatMessages` 调用点改读完整 `ManagedModel` (新 `getCachedModel`), 废弃 `getModelProvider`
-- **breaking**: DashScope / Zhipu / DeepSeek 三家 provider 的模型, 如上游返回 `preferred_format: "anthropic"`, 请求将从 `/chat` 切换到 `/anthropic` 端点。若需保留旧行为, Gateway 侧把 `SupportedFormats` 限定为 `["openai"]` 或 `PreferredFormat: "openai"` 即可显式覆盖
-- **compat**: 旧版 SDK 读不到新字段, 继续走 `/chat` — 向后兼容未破坏
-- **test**: `adapter_test.go` 覆盖 8 个用例 — PreferredFormat 覆盖硬编码 / SupportedFormats 多值选择 / 大小写 / 空值回落
-
-### v0.9.0 — Thinking Level 自动组装
-
-- **feat(thinking)**: 新增三档语义化思考级别 API
-  - 常量: `ThinkingOff` / `ThinkingHigh` / `ThinkingMax`
-  - 便捷构造: `NewThinkingConfig(level)`
-  - `ThinkingConfig` 新增 `Level` 字段 (json:"level,omitempty")
-  - 辅助常量: `ThinkingHighMinMaxTokens` (32K) / `ThinkingMaxFallbackMaxTokens` (128K)
-- **feat(adapter)**: `resolveThinkingLevel` 在 `AnthropicAdapter.BuildRequestBody` 中自动组装
-  - Level 非空时 SDK 接管 `thinking` + `effort` + `max_tokens` 三字段
-  - 模型不支持 `adaptive` 时自动回退 `enabled + budget_tokens = max_tokens - 1`
-  - Level 非 `off` 时自动删除 `temperature` (Anthropic API 互斥约束)
-  - Level=`high`/`max` 且 `SupportsEffort` 时自动注入 `effort-2025-11-24` beta
-- **feat(capabilities)**: `ModelCapabilities` 新增 `SupportsDeepThinking` (Opus 4.6 深度思考门控)
-- **compat**: `Level=""` 时保持 v0.8.0 passthrough — 老代码零影响
-- **test**: `thinking_test.go` 覆盖 off/high/max × adaptive/old model 共 9 个 case + betaEffort 注入 + temperature 互斥
-
-### v0.8.0 — Thinking / Effort Passthrough 兼容基线
-
-- `ThinkingConfig` / `EffortConfig` 保持 passthrough 序列化语义 (调用方自行组装完整字段)
-- 作为 v0.9.0 Level API 的兼容基线 — `Level=""` 时仍走此路径, 老代码零影响
-- (`thinking_test.go` 以 `nil thinking → v0.8.0 passthrough` case 固化此行为)
-
-### v0.7.0 — 文档修订
-
-- 修正开发手册中默认 `ServerURL` 的描述（`acosmi.com` 一直是代码默认, 仅文档误写为 `acosmi.ai`）
-- `acosmi.com` (大陆) 与 `acosmi.ai` (国际) 端点完全兼容, 按业务区域显式传入即可
-
-### v0.6.0 (2026-04-13) — 通知系统 + 设备注册
-
-- **feat(notification)**: 新增 9 个通知管理方法
-  - `ListNotifications` / `GetUnreadCount` — 分页查询 + 轻量未读数
-  - `MarkNotificationRead` / `MarkAllNotificationsRead` — 单条/批量已读
-  - `DeleteNotification` — 删除通知
-  - `RegisterDevice` / `UnregisterDevice` — 推送设备 Token 注册/注销
-  - `ListNotificationPreferences` / `UpdateNotificationPreference` — 通知偏好 CRUD
-- **feat(types)**: 新增 6 个类型
-  - `Notification` / `NotificationList` / `NotificationUnreadCount`
-  - `NotificationPreference` / `DeviceRegistration`
-  - `ParseNotificationEvent(WSEvent)` — WebSocket 通知事件解析辅助函数
-- 所有新方法遵循 `doJSON` + `APIResponse[T]` 既有模式，完全向后兼容
-
-### v0.5.0 (2026-04-11) — 多厂商 Provider Adapter
-
-- **feat(adapter)**: 新增 ProviderAdapter 接口 — per-provider 路由 + 格式转换
-  - `AnthropicAdapter`: `/anthropic` 端点，完整 betas/ServerTools 注入
-  - `OpenAIAdapter`: `/chat` 端点，无 betas，扩展字段透传 Gateway
-- `buildChatRequest` 委托 adapter，返回 `([]byte, ProviderAdapter, error)`
-- `Chat()` / `ChatMessages()` / `ChatStream()` / `ChatMessagesStream()` 全部按 provider 路由
-- `ChatMessages()` 拆分为 `chatMessagesAnthropic()` / `chatMessagesOpenAI()`
-- 新增 `getModelProvider()` — 从模型缓存获取 provider，默认回退 "anthropic"
-- 新增 `openAIStreamConverter` — OpenAI SSE → Anthropic 事件转换 (thinking/text/tool_calls)
-- 新增 `parseOpenAIResponseToAnthropic()` — OpenAI 响应 → AnthropicResponse
-- 新增 10 个 OpenAI 响应类型: `OpenAIChatResponse` / `OpenAIChatChoice` / `OpenAIChatMessage` / `OpenAIToolCall` / `OpenAIFunctionCall` / `OpenAIUsage` / `OpenAIStreamChunk` / `OpenAIStreamChoice` / `OpenAIStreamDelta` / `OpenAIStreamToolCall`
-- CrabCode `filterAnthropicModels` → `filterSupportedModels`: 添加 moonshot/volcengine
-- CrabCode `chatErrorToDetail`: 新增 `invalid_request_error` 检测 (code 3003)
-
-### v0.4.1 (2026-04-10) — 全量审计修复
-
-- **fix(betas)**: Anthropic 端点 betas 静默丢失 — `AnthropicProxyRequest.Betas` 从 `json:"-"` 改为 `json:"betas,omitempty"` 支持 body 传递 (header 仍优先覆盖)
-- 端点路由 `/messages` → `/anthropic` (区分格式，不拼接上游后缀)
-- `parseHTTPError()` 统一 6 处错误解析 (兼容 Anthropic + OpenAI 错误格式)
-- `AnthropicUsage` 补齐 `CacheCreationInputTokens` / `CacheReadInputTokens`
-- `AnthropicResponse` 补齐 `StopSequence` 字段
-- 新增 `ThinkingContent()` / `ToolUseBlocks()` 辅助方法
-- Gateway: `adaptAnthropic`/`adaptPassthrough` 提取 `applyCommonFields` 消除重复
-- Gateway: 流式 token 提取 OpenAI/Anthropic 分路径 + 字符串预检优化
-- CGO: 5 个 Rust FFI 包添加 `//go:build cgo` + `!cgo` stub
-- **fix(endpoint)**: 新增 `providerAnthropicEndpoints` 映射 — DeepSeek/DashScope/Zhipu 各自 Anthropic 端点，修复 Chat() 调用 /anthropic 时上游 404
-- Gateway: `ResolveEndpoint` 增加 `anthropicFormat` 参数，Anthropic 端点表优先 + 回退警告日志
-
-### v0.4.0 (2026-04-10) — Anthropic 原生格式支持
-
-- 新增 `ChatMessages()` 同步调用 Anthropic 原生端点 (`POST /:id/anthropic`)
-- 新增 `ChatMessagesStream()` 流式调用 Anthropic 原生端点
-- 新增 `AnthropicResponse` / `AnthropicContentBlock` / `AnthropicUsage` 类型
-- 新增 `AnthropicResponse.TextContent()` 便捷方法
-- Anthropic 流式无 `started`/`settled`/`failed` 自定义事件，无 `[DONE]`，`message_stop` 为自然结束
-
-### v0.3.1 (2026-04-09) — 开发手册审计修正
-
-- 补齐遗漏 API 文档: `ClaimMonthlyFree` / `WaitForPayment` / `ValidateSkill` / `LoginWithHandler`
-- 修正 `UploadSkill` scope 参数 (`"PUBLIC"` → `"TENANT"`)
-- 修正 `ListEntitlements` 参数大小写 (`"active"` → `"ACTIVE"`)
-- 补齐§6 遗漏类型: `BalanceDetail` / `BusinessError` / `OrderTerminalError` / `LoginEvent` / `OptimizeSkillRequest` / `SkillSummary` / `SkillBrowseResponse` 等
-- 更新§7 完整示例对齐 `ChatStreamWithUsage` 4-channel API
-- 修正 CLI 子命令计数 (14 → 13)
-
-### v0.3.0 (2026-04-06) — Capabilities 驱动化 + 搜索来源
-
-- `ModelCapabilities` 新增 `SupportsAutoMode`
-- 新增 `WebSearchSource` / `SourcesEvent` / `ParseSourcesEvent`
-- **Breaking**: `ChatStreamWithUsage` 返回 4 channel (新增 sourcesCh)
-
-### v0.2.1 (2026-04-06) — 实时余额推送
-
-- `ChatResponse` 新增 `TokenRemaining` / `CallRemaining` (Header 填充)
-- 新增 `StreamSettlement` + `ParseSettlement`
-- 新增 `ChatStreamWithUsage` 高级流式 API
-- `Chat()` 改用 `doJSONFull` 读取余额 Header
-- 审计: channel send 防泄漏 + failed 事件正确路由
-
-### v0.2.0 (2026-04-06) — CrabCode 扩展能力
-
-- 新增 `betas.go` — 11 项 Beta Header 自动组装
-- `ChatRequest` 新增 12 个扩展字段 (全部 `json:"-"`)
-- 新增 `ModelCapabilities` (16 项能力标记)
-- 新增 `buildChatRequest` 内部序列化 + 模型缓存 (5min TTL)
-- 新增 `LoginWithHandler` + 函数式选项 (CrabCode 适配)
-- 后端: `sanitizeBetas` + `safePositiveInt` + `ManagedModelPublicResponse`
-- 后端: Chat 输入校验 (betas≤20, tools≤50, messages≤500)
-
-### v0.1.0 (2026-03-22) — 初始发布
-
-- 合并 desktop-sdk-go + jineng-sdk-go
-- 34 个公开 API + CrabClaw-Skill CLI (13 命令)
-- 18 项根因修复
+- `v0.3.x`：模型能力矩阵、搜索来源、`ChatStreamWithUsage` 四通道返回、开发手册补全。
+- `v0.2.x`：余额 Header、结算事件、扩展字段、模型缓存、`LoginWithHandler`。
+- `v0.1.0`：初始发布，合并 desktop-sdk-go 与 jineng-sdk-go。
 
 ---
 
