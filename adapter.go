@@ -1,11 +1,15 @@
 // adapter.go — Provider Adapter 接口与注册表
 //
-// SDK 层 per-provider 路由：
-//   Provider == "anthropic" → AnthropicAdapter → POST /managed-models/:id/anthropic
-//   Provider != "anthropic" → OpenAIAdapter    → POST /managed-models/:id/chat
+// SDK 层按上游托管模型元数据选路：
+//   PreferredFormat == "anthropic" → AnthropicAdapter → POST /managed-models/:id/anthropic
+//   PreferredFormat == "openai"    → OpenAIAdapter    → POST /managed-models/:id/chat
+//
+// 旧上游若未返回 PreferredFormat / SupportedFormats，SDK 才回落到 provider 名称：
+//   provider == "anthropic" / "acosmi" → AnthropicAdapter
+//   其他 provider                     → OpenAIAdapter
 //
 // SDK 只负责：格式路由 + 请求结构转换 + 响应结构转换
-// 厂商特定参数（如 enable_thinking）由 Nexus Gateway per-provider adapter 处理
+// 厂商特定协议差异（endpoint/auth/region/字段裁剪）由 Nexus Gateway Profile 处理
 
 package acosmi
 
