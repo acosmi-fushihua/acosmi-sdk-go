@@ -532,6 +532,38 @@ if caps.SupportsDeepThinking {
 }
 ```
 
+#### 同 model_id 多 wireFormat 共存 (Gateway 2026-04-26+)
+
+DashScope / Zhipu / DeepSeek 等同时支持 Anthropic / OpenAI 兼容端点的 provider, 支持
+**同一个 `modelId` 挂两份不同 `compat_profile` 的托管模型记录**:
+
+```
+qwen3.6-plus  +  aliyun_dashscope_anthropic_v1   →  /anthropic 端点
+qwen3.6-plus  +  dashscope_openai_compat_v1      →  /chat 端点
+```
+
+DB 唯一键升级: `(tenant_id, model_id, compat_profile)` partial unique。
+`ListModels()` 缓存里同 `ModelID` 出现两条记录, 各自 `PreferredFormat` 不同:
+
+```go
+models, _ := client.ListModels(ctx)
+for _, m := range models {
+    fmt.Printf("%s [profile=%s] preferred=%s supported=%v\n",
+        m.ModelID, m.Provider, m.PreferredFormat, m.SupportedFormats)
+}
+// 可能输出:
+//   qwen3.6-plus [profile=dashscope] preferred=anthropic supported=[anthropic openai]
+//   qwen3.6-plus [profile=dashscope] preferred=openai    supported=[openai]
+```
+
+**SDK 路由语义**: SDK 端按 `getCachedModel(modelID)` 命中**首条**记录用于 `PreferredFormat`
+判定; **endpoint 路径已隐含 wireFormat** (`/anthropic` vs `/chat`), 后端按
+endpoint 类型选**正确的那条** ManagedModel —— SDK 调用方无需感知双记录, 透明工作。
+
+> 业务场景: 一个 model_id 想同时服务 Anthropic / OpenAI 两类客户 (例如
+> Claude 客户端走 Anthropic, ChatGPT 客户端走 OpenAI), 配两份各自独立的 API key /
+> endpoint / capabilities。
+
 ### 4.4 权益管理
 
 > scope: `ai`
@@ -558,6 +590,40 @@ records, _ := client.ListConsumeRecords(ctx, 1, 20)
 // 领取当月免费额度 (幂等: 已领取返回已有权益, 不重复发放)
 ent, _ := client.ClaimMonthlyFree(ctx)
 ```
+
+#### 模型白名单自动同步 (Gateway 2026-04-26+)
+
+历史问题: tk-dist `entitlements.allowed_models` 字段是套餐购买时写入的字符串数组快照,
+管理员在 Gateway 加新 ManagedModel 时**不会自动更新存量用户白名单** → 用户调用新模型
+返回 403 "权益包不包含此模型"。
+
+**Gateway 侧已加入三层闭环**:
+
+1. **启动追平**: nexus-backend 启动时跑一次 `SyncAllManagedModelWhitelist`, 把所有
+   `is_enabled=true` 的 `managed_models.model_id` 合并进所有 ACTIVE TOKEN_PACKAGE
+   `entitlements.allowed_models`。
+2. **Create/Update 增量同步**: 管理员后台新建或启用一个 ManagedModel, 后端 hook
+   异步同步该 model_id 到所有付费 entitlement 白名单。
+3. **Hold 失败兜底**: 如果用户首次调用碰上 `IsModelNotAllowed` 且该 model_id 是
+   `ACTIVE` 状态, 后端**自动同步白名单 + 重试一次 Hold**。SDK 调用方**感知不到**这次内部重试。
+
+**SDK 端无需任何改动**, 只需对 403 响应做正常兜底处理:
+
+```go
+resp, err := client.Chat(ctx, modelID, req)
+if err != nil {
+    var apiErr *acosmi.APIError
+    if errors.As(err, &apiErr) && apiErr.StatusCode == 403 {
+        // 极端情况下兜底失败 (跨库连接故障 / 模型已禁用), 文案会提示
+        // "已尝试自动同步白名单仍失败, 请联系管理员"
+        log.Printf("model not in plan: %s", apiErr.Message)
+    }
+}
+```
+
+> **关于 `MONTHLY_QUOTA` / `REGISTRATION_BONUS` / `INVITE_REWARD` 类型**:
+> 这些 entitlement 的 `allowed_models` 设计上为空 (按 type 维度授权, 不限模型),
+> 同步只覆盖 `TOKEN_PACKAGE` 类型 (套餐购买快照需追平)。
 
 ### 4.5 流量包商城
 
