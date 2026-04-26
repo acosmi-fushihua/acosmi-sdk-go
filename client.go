@@ -900,9 +900,9 @@ func (c *Client) ChatStreamWithUsage(ctx context.Context, modelID string, req Ch
 			}
 			// 失败事件: 解析错误信息发送到 errCh
 			if ev.Event == "failed" {
-				errMsg := parseStreamError(ev.Data)
+				se := parseStreamError(ev.Data)
 				select {
-				case errCh <- fmt.Errorf("stream failed: %s", errMsg):
+				case errCh <- se:
 				case <-ctx.Done():
 				}
 				return
@@ -925,19 +925,59 @@ func (c *Client) ChatStreamWithUsage(ctx context.Context, modelID string, req Ch
 	return contentCh, sourcesCh, settleCh, errCh
 }
 
-// parseStreamError 从 failed 事件 JSON 中提取错误描述
-func parseStreamError(data string) string {
+// StreamError 流式失败事件的结构化表示。
+//
+// 由 gateway 的 `managed_model_stream_failed` 事件解析得到。客户端可通过
+// errors.As(err, &se) 提取并:
+//   - 按 Code 做 i18n / 重试决策 (例: Code == "empty_response" → 自动重试)
+//   - 按 Retryable 做退避决策
+//   - 按 Message 做用户可见提示 (gateway 已下发中文文案; 为空时由调用方兜底)
+//
+// 实现 error 接口, 与历史 Go error 兼容, 旧调用方 `err.Error()` 文案保持稳定。
+type StreamError struct {
+	Code      string // 例: "empty_response" / "rate_limit" / "overloaded" / ""
+	Stage     string // 例: "provider" / "settlement"
+	Message   string // 用户友好提示 (中文); 历史字段, 与 RawError 区分
+	RawError  string // gateway 原始 error 字符串 (含 provider/model/latency 等 debug 信息)
+	Retryable bool   // 客户端是否值得重试
+}
+
+// Error 实现 error 接口, 文案保持向后兼容: "stream failed: <stage>: <raw>".
+func (e *StreamError) Error() string {
+	if e == nil {
+		return ""
+	}
+	body := e.RawError
+	if body == "" {
+		body = e.Message
+	}
+	if e.Stage != "" {
+		return "stream failed: " + e.Stage + ": " + body
+	}
+	return "stream failed: " + body
+}
+
+// parseStreamError 从 failed 事件 JSON 中提取结构化错误。
+// 兼容旧 schema (仅 stage/error 字段) — 新字段 errorCode/retryable/message 缺失时回退为零值。
+// JSON 解析失败时退化为 RawError=原始数据, Code/Retryable 为零值。
+func parseStreamError(data string) *StreamError {
 	var payload struct {
-		Error string `json:"error"`
-		Stage string `json:"stage"`
+		ErrorCode string `json:"errorCode"`
+		Stage     string `json:"stage"`
+		Error     string `json:"error"`
+		Message   string `json:"message"`
+		Retryable bool   `json:"retryable"`
 	}
 	if err := json.Unmarshal([]byte(data), &payload); err != nil {
-		return data // fallback: 原始数据
+		return &StreamError{RawError: data}
 	}
-	if payload.Stage != "" {
-		return payload.Stage + ": " + payload.Error
+	return &StreamError{
+		Code:      payload.ErrorCode,
+		Stage:     payload.Stage,
+		Message:   payload.Message,
+		RawError:  payload.Error,
+		Retryable: payload.Retryable,
 	}
-	return payload.Error
 }
 
 // ============================================================================
