@@ -309,3 +309,91 @@ data: {"type":"message_stop"}
 		t.Error(msg)
 	}
 }
+
+// =============================================================================
+// v0.14.1 (V2 P0.7): event:error → errCh 路由 (Anthropic 协议失败语义)
+//
+// 关键不变量:
+//   - "event: error" 和 "event: failed" 都路由到 errCh, 不会被当成 content 透传
+//   - errCh 收到的是 *StreamError, 含结构化 Code/Retryable/Message
+//   - contentCh 在 error 后立即关闭, 不再有事件
+//   - 历史 V0.13.1 仅识别 "failed", error 当成 content 透传 → 客户端无法 errors.As
+//     这个回归测试守住该口子
+// =============================================================================
+func TestChatStreamWithUsage_EventErrorRoutesToErrCh(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		flusher, _ := w.(http.Flusher)
+
+		// 1. 先发一个 message_start 给客户端 — 模拟流已建立
+		_, _ = w.Write([]byte("event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"m_1\"}}\n\n"))
+		flusher.Flush()
+
+		// 2. 然后 mid-stream 发 event:error (Anthropic 协议 + acosmi 私有扩展)
+		errPayload := `{"type":"error","error":{"type":"overloaded_error","message":"上游连接中断"},"errorCode":"upstream_disconnect","retryable":true,"message":"上游连接中断, 请重试或更换模型","stage":"provider"}`
+		_, _ = w.Write([]byte("event: error\ndata: " + errPayload + "\n\n"))
+		flusher.Flush()
+	}))
+	defer srv.Close()
+
+	c := newTestClient(t, srv.URL, "m-1")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	contentCh, _, _, errCh := c.ChatStreamWithUsage(ctx, "m-1", ChatRequest{
+		RawMessages: []any{map[string]any{"role": "user", "content": "hi"}},
+	})
+
+	// 收到 message_start (内容事件) 后, 必须收到结构化 error
+	var contentEvents []StreamEvent
+	for ev := range contentCh {
+		contentEvents = append(contentEvents, ev)
+	}
+
+	// 至少 message_start 经过了 contentCh
+	if len(contentEvents) < 1 {
+		t.Fatalf("expected at least message_start in contentCh, got %d events", len(contentEvents))
+	}
+	for _, ev := range contentEvents {
+		if ev.Event == "error" {
+			t.Errorf("event:error MUST NOT leak to contentCh, got %+v", ev)
+		}
+	}
+
+	// errCh 必须收到 *StreamError (Anthropic 协议路径不再丢失结构化错误)
+	select {
+	case err := <-errCh:
+		if err == nil {
+			t.Fatal("expected non-nil error from errCh")
+		}
+		var se *StreamError
+		if !errorsAs(err, &se) {
+			t.Fatalf("expected *StreamError, got %T: %v", err, err)
+		}
+		if se.Code != "upstream_disconnect" {
+			t.Errorf("Code=%q, want upstream_disconnect", se.Code)
+		}
+		if !se.Retryable {
+			t.Error("Retryable must be true (transport disconnect)")
+		}
+		if !strings.Contains(se.Message, "上游连接中断") {
+			t.Errorf("Message=%q, want contain 上游连接中断", se.Message)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("errCh did not receive error within 3s — event:error not routed!")
+	}
+}
+
+// errorsAs 包装 errors.As, 避免 import cycle (本测试包外部 errors 已在其他文件 import)。
+func errorsAs(err error, target any) bool {
+	se, ok := err.(*StreamError)
+	if !ok {
+		return false
+	}
+	if t, ok := target.(**StreamError); ok {
+		*t = se
+		return true
+	}
+	return false
+}

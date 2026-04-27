@@ -1,6 +1,6 @@
 # Acosmi Go SDK 开发手册
 
-> v0.13.2 | Go 1.22+ | MIT
+> v0.14.0 | Go 1.22+ | MIT
 
 ## 目录
 
@@ -313,6 +313,63 @@ if err := <-errCh; err != nil {
 }
 ```
 
+#### 流式错误结构化处理 — *StreamError (v0.14.1+)
+
+`errCh` 收到的 error 在大多数场景是 `*acosmi.StreamError`,可用 `errors.As` 提取结构化字段做重试决策:
+
+```go
+import "errors"
+
+if err := <-errCh; err != nil {
+    var se *acosmi.StreamError
+    if errors.As(err, &se) {
+        // se.Code      错误分类 (gateway gwerrors.Kind 同口径)
+        // se.Retryable 是否值得重试
+        // se.Message   用户面友好文案 (中文)
+        // se.RawError  上游原始错误 / 调试信息
+        // se.Stage     发生阶段 ("provider" / "settlement")
+
+        if se.Retryable {
+            // 等 200ms-1s 后重试 (网关已做 1 次透明重试,此处再重试是双保险)
+            log.Printf("retrying: %s [%s]", se.Message, se.Code)
+            // ... 重试逻辑 ...
+        } else {
+            log.Fatalf("non-retryable: %s [%s]", se.Message, se.Code)
+        }
+    } else {
+        // 非 StreamError 的错误 (transport / build-time / token refresh fail 等)
+        log.Fatal(err)
+    }
+}
+```
+
+**Code 取值参考** (网关 V2 P0 起,值与 backend `gwerrors.Kind` 完全对齐):
+
+| Code | Retryable | 含义 |
+|---|---|---|
+| `empty_response` | ✅ | 上游 200 + 空 body / 0 SSE chunks |
+| `rate_limit` | ✅ | 上游 429 (附带 Retry-After) |
+| `overloaded` | ✅ | 上游 529 / body 含 overloaded |
+| `server` | ✅ | 上游 5xx |
+| `upstream_timeout` | ✅ | 网关到上游超时 (ctx deadline / dial timeout) |
+| `upstream_disconnect` | ✅ | EOF / ECONNRESET (网关已做 1 次透明重试,SDK 看到说明 2 次都失败) |
+| `upstream_unreachable` | ❌ | DNS / TLS / dial refused |
+| `upstream_malformed` | ❌ | 上游 200 但 body 解析失败 |
+| `client_canceled` | ❌ | 用户主动 abort (一般 SDK 不会收到) |
+| `authentication` | ❌ | 凭证错 |
+| `arrearage` | ❌ | 余额不足 |
+| `model_not_found` | ❌ | 模型未找到 |
+| `not_found` | ❌ | 端点 404 |
+| `invalid_request` | ❌ | 请求 body 格式错 |
+
+**event 名兼容性** (v0.14.1 起):
+SDK 同时识别 `event: failed` (acosmi managed-model 协议) 和 `event: error` (Anthropic 协议),两者都路由到 `errCh`,由 `parseStreamError` 统一解码三种 schema:
+- acosmi 老协议: `{errorCode, stage, error: "string", message, retryable}`
+- Anthropic 协议 + acosmi 私有扩展: `{type:"error", error:{type, message}, errorCode, retryable, message, stage}`
+- Anthropic 标准纯净: `{type:"error", error:{type, message}}` (此时 `Code` 用 `error.type` 兜底)
+
+> v0.14.0 及以下版本不识别 `event: error`,在 `/managed-models/<id>/anthropic` 路径上拿不到结构化错误。建议升级到 v0.14.1+。
+
 #### 流式聊天 — ChatStream (低级 API)
 
 返回原始事件流，需自行处理控制事件 (`started`/`settled`/`pending_settle`/`failed`/`sources`):
@@ -327,7 +384,9 @@ for event := range eventCh {
     switch event.Event {
     case "started", "pending_settle", "sources":
         continue // 控制事件，跳过
-    case "failed":
+    case "failed", "error":
+        // v0.14.1: managed-model 协议是 "failed", Anthropic 协议是 "error",均路由到此
+        // 推荐改用 ChatStreamWithUsage,errCh 已自动归并
         log.Printf("stream failed: %s", event.Data)
         continue
     }
@@ -1501,6 +1560,34 @@ make install    # → $GOPATH/bin
 ## 12. 版本记录
 
 > 本节只保留 SDK 使用者最需要关心的兼容点与破坏性变更。更细的网关实现背景、审计过程和分阶段交付记录，建议查主仓架构文档。
+
+### v0.14.1 (2026-04-26) — 错误码细化 V2 P0
+
+- **`event: error` 路由** (`ChatStreamWithUsage`): 同时识别 `failed` (acosmi 协议) 与 `error` (Anthropic 协议),均路由到 `errCh`。≤v0.14.0 在 `/managed-models/<id>/anthropic` 路径上拿不到结构化错误,建议升级。
+- **`parseStreamError` 三态 schema**: `error` 字段用 `json.RawMessage` 接收,运行时区分 string (acosmi 老协议) / object (Anthropic) / 缺失。Anthropic 纯净格式下 `Code` 自动从 `error.type` 兜底,避免 `errors.As` 拿到空 Code 无法决策。
+- **`*StreamError` 字段稳定**: `Code` / `Retryable` / `Message` / `RawError` / `Stage` 五字段无破坏性变更, `Error()` 文案严格保留。
+- **新错误码** (与网关 `gwerrors.Kind` 对齐): `upstream_timeout` / `upstream_disconnect` / `upstream_unreachable` / `upstream_malformed` / `client_canceled`,详见 §4.3 错误码表。
+- **网关侧关联** (无破坏): 透明重试 200ms 单次退避吃掉 80%+ 瞬断, 5 family provider 计费按 token 不双扣; admin 看板 `WHERE status` 改用 `NOT IN ('success','pending_settle')` 反向兜底,新 kind 自动入"错误"统计。
+
+### v0.14.0 (2026-04-26)
+
+- **冷缓存根治**: `Chat` / `ChatMessages` / `ChatStream` / `ChatMessagesStream` 在
+  模型缓存未命中时**自动触发一次 `ListModels()` 刷新**, 仍未找到返回
+  `*ModelNotFoundError`; 不再静默回退到 Anthropic 路由 (修复 F2 根因)
+  - 调用方可 `errors.As(err, &mnf)` 捕获处理。
+- **Adapter 路由注释澄清**: `adapter.go` 注释明确声明优先级链
+  `PreferredFormat → SupportedFormats → provider 名硬编码 fallback`,
+  与 `getAdapterForModel` 实际行为对齐。
+- **网关侧能力对齐 (docs)**:
+  - § 4.3 § 同 model_id 多 wireFormat 共存 — DashScope/Zhipu/DeepSeek 现可挂同
+    model_id 的 anthropic + openai 双 ManagedModel 记录, DB 唯一键升级到
+    `(tenant_id, model_id, compat_profile)`; SDK 调用透明无需感知, 后端按 endpoint
+    路径自动选对应记录。
+  - § 4.4 § 模型白名单自动同步 — 三层闭环 (启动追平 + Create/Update 增量 + Hold
+    失败兜底); SDK 端 403 兜底处理建议; 类型语义 (仅 TOKEN_PACKAGE 同步,
+    其他 type allowed_models 设计上为空 = 不限模型)。
+  - 错误文案诚实化: 老版"权益包不包含此模型,请购买"误导付费用户去重新购买,
+    新版告知"已尝试自动同步,联系管理员"。
 
 ### v0.13.2 / v0.13.1 (2026-04-22)
 
