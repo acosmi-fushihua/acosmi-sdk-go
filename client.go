@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"mime/multipart"
@@ -37,6 +38,14 @@ type Client struct {
 	mu        sync.RWMutex
 	ws        *wsState // WebSocket 长连接状态 (nil = 未连接)
 
+	// v0.15.1: token 就绪等待机制
+	// tokenReady: NewClient(已有 token)/loginInternal 成功后 close, 等待方解除阻塞
+	// tokenOnce:  保证 close 幂等; Logout 时与 tokenReady 一同重置
+	// loginInFlight: true=Login 进行中, 等待方需等; false=未调 Login, 等待方 fail-fast
+	tokenReady    chan struct{}
+	tokenOnce     sync.Once
+	loginInFlight bool
+
 	// 模型能力缓存 (CrabCode 扩展)
 	modelCache     []ManagedModel // ListModels 缓存
 	modelCacheTime time.Time      // 缓存写入时间
@@ -44,6 +53,9 @@ type Client struct {
 	// v0.11.0: 请求前防御钩子。nil = 未启用, 零开销。
 	defensiveCfg       *sanitize.MinimalSanitizeConfig
 	autoStripEphemeral bool
+
+	// L6 (v0.15): 重试策略. nil = 禁用 (v0.14.1 行为).
+	retryPolicy *RetryPolicy
 }
 
 // Config 客户端配置
@@ -58,6 +70,15 @@ type Config struct {
 
 	// HTTPClient 自定义 HTTP 客户端，nil 则使用默认
 	HTTPClient *http.Client
+
+	// RetryPolicy 重试策略 (L6, v0.15).
+	//
+	// nil = 禁用重试 (v0.14.1 行为, 老调用方 0 影响).
+	// 非 nil = 启用 — 默认 SafeToRetry POST=false 兜底, chat/messages POST 仍 0 retry.
+	// GET 类查询 (skill-store/models/balance) 自动得 2x 稳定性.
+	//
+	// 计费安全: 自定义 SafeToRetry 时, 严禁让 POST chat/messages 通过, 否则双扣.
+	RetryPolicy *RetryPolicy
 }
 
 // NewClient 创建客户端 (自动加载已保存的 token)
@@ -83,14 +104,17 @@ func NewClient(cfg Config) (*Client, error) {
 	}
 
 	c := &Client{
-		serverURL: strings.TrimRight(cfg.ServerURL, "/"),
-		store:     store,
-		http:      httpClient,
+		serverURL:   strings.TrimRight(cfg.ServerURL, "/"),
+		store:       store,
+		http:        httpClient,
+		retryPolicy: effectivePolicy(cfg.RetryPolicy),
+		tokenReady:  make(chan struct{}),
 	}
 
 	// 尝试加载已保存的 token
 	if tokens, err := store.Load(); err == nil && tokens != nil {
 		c.tokens = tokens
+		c.tokenOnce.Do(func() { close(c.tokenReady) })
 	}
 
 	return c, nil
@@ -148,6 +172,15 @@ func (c *Client) loginInternal(ctx context.Context, appName string, scopes []str
 	if cfg == nil {
 		cfg = &loginConfig{}
 	}
+	// v0.15.1: 标记 Login 进行中, 让并发的 ensureToken 等待方知道"应等"而非"立即报错"
+	c.mu.Lock()
+	c.loginInFlight = true
+	c.mu.Unlock()
+	defer func() {
+		c.mu.Lock()
+		c.loginInFlight = false
+		c.mu.Unlock()
+	}()
 	emit := func(e LoginEvent) {
 		if cfg.handler != nil {
 			cfg.handler(e)
@@ -214,10 +247,11 @@ func (c *Client) loginInternal(ctx context.Context, appName string, scopes []str
 		return fmt.Errorf("token exchange failed: %w", err)
 	}
 
-	// 5. 持久化
+	// 5. 持久化 + 通知等待方 (单锁内完成, 防与 Logout 重置 tokenOnce/tokenReady 竞争)
 	tokens := NewTokenSet(tokenResp, clientID, c.serverURL)
 	c.mu.Lock()
 	c.tokens = tokens
+	c.tokenOnce.Do(func() { close(c.tokenReady) })
 	c.mu.Unlock()
 
 	if err := c.store.Save(tokens); err != nil {
@@ -237,6 +271,9 @@ func (c *Client) Logout(ctx context.Context) error {
 	meta := c.meta
 	c.tokens = nil
 	c.meta = nil
+	// v0.15.1: 重置等待信号 — 下次 Login 重新触发等待→唤醒流程
+	c.tokenReady = make(chan struct{})
+	c.tokenOnce = sync.Once{}
 	c.mu.Unlock()
 
 	if tokens != nil {
@@ -270,13 +307,34 @@ func (c *Client) GetTokenSet() *TokenSet {
 // ============================================================================
 
 // ensureToken 确保有有效的 access_token，过期则自动刷新
+//
+// v0.15.1: 当 tokens==nil 且 Login 正在并发进行中时, 阻塞等待 token 就绪,
+// 避免应用启动期 "Login + 多个 API 调用" 并发场景下 4+ 条 "not authorized" 误报.
+// Login 未启动时仍 fail-fast (保留原错误信息).
 func (c *Client) ensureToken(ctx context.Context) (string, error) {
 	c.mu.RLock()
 	tokens := c.tokens
+	ready := c.tokenReady
+	inFlight := c.loginInFlight
 	c.mu.RUnlock()
 
 	if tokens == nil {
-		return "", fmt.Errorf("not authorized, call Login() first")
+		if !inFlight {
+			return "", fmt.Errorf("not authorized, call Login() first")
+		}
+		// Login 进行中, 等待就绪或 ctx 超时
+		select {
+		case <-ready:
+			c.mu.RLock()
+			tokens = c.tokens
+			c.mu.RUnlock()
+			if tokens == nil {
+				// 边界: 等待期间被 Logout 重置, 当作未授权
+				return "", fmt.Errorf("not authorized, call Login() first")
+			}
+		case <-ctx.Done():
+			return "", fmt.Errorf("waiting for token: %w", ctx.Err())
+		}
 	}
 
 	if !tokens.IsExpired() {
@@ -660,7 +718,7 @@ func (c *Client) chatMessagesStreamInternal(ctx context.Context, modelID string,
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("Accept", "text/event-stream")
 
-	resp, err := c.http.Do(httpReq)
+	resp, err := c.doRequest(httpReq)
 	if err != nil {
 		errCh <- err
 		return
@@ -680,7 +738,7 @@ func (c *Client) chatMessagesStreamInternal(ctx context.Context, modelID string,
 
 	if resp.StatusCode != http.StatusOK {
 		bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorBodySize))
-		errCh <- parseHTTPError(resp.StatusCode, bodyBytes)
+		errCh <- parseHTTPErrorWithHeader(resp.StatusCode, bodyBytes, resp.Header)
 		return
 	}
 
@@ -788,7 +846,7 @@ func (c *Client) chatStreamInternal(ctx context.Context, modelID string, req Cha
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("Accept", "text/event-stream")
 
-	resp, err := c.http.Do(httpReq)
+	resp, err := c.doRequest(httpReq)
 	if err != nil {
 		errCh <- err
 		return
@@ -809,7 +867,7 @@ func (c *Client) chatStreamInternal(ctx context.Context, modelID string, req Cha
 	if resp.StatusCode != http.StatusOK {
 		// 根因修复 #4: 限制错误响应体大小
 		bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorBodySize))
-		errCh <- parseHTTPError(resp.StatusCode, bodyBytes)
+		errCh <- parseHTTPErrorWithHeader(resp.StatusCode, bodyBytes, resp.Header)
 		return
 	}
 
@@ -1359,7 +1417,7 @@ func (c *Client) DownloadSkill(ctx context.Context, skillID string) ([]byte, str
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
 
-	resp, err := c.http.Do(req)
+	resp, err := c.doRequest(req)
 	if err != nil {
 		return nil, "", fmt.Errorf("download skill: %w", err)
 	}
@@ -1376,7 +1434,7 @@ func (c *Client) DownloadSkill(ctx context.Context, skillID string) ([]byte, str
 
 	if resp.StatusCode != http.StatusOK {
 		bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorBodySize))
-		return nil, "", fmt.Errorf("download skill: %w", parseHTTPError(resp.StatusCode, bodyBytes))
+		return nil, "", fmt.Errorf("download skill: %w", parseHTTPErrorWithHeader(resp.StatusCode, bodyBytes, resp.Header))
 	}
 
 	// 根因修复 #5: 限制最大下载体积
@@ -1433,15 +1491,18 @@ func (c *Client) uploadSkillInternal(ctx context.Context, zipData []byte, scope,
 	}
 	writer.Close()
 
+	// L6 (v0.15) 注: bodyBytes 用 buf.Bytes() 快照, 但 SafeToRetry POST 默认 false →
+	// 即使 RetryPolicy 启用也走单次 (与 doRequest 等价); 此处升级仅为统一调用模式 + 错误类型化.
+	bodyBytes := buf.Bytes()
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
-		c.apiURL("/skill-store/upload"), &buf)
+		c.apiURL("/skill-store/upload"), bytes.NewReader(bodyBytes))
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Content-Type", writer.FormDataContentType())
 
-	resp, err := c.http.Do(req)
+	resp, err := c.doRequestWithRetry(req, bodyBytes)
 	if err != nil {
 		return nil, err
 	}
@@ -1458,7 +1519,7 @@ func (c *Client) uploadSkillInternal(ctx context.Context, zipData []byte, scope,
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorBodySize))
-		return nil, fmt.Errorf("upload: %w", parseHTTPError(resp.StatusCode, bodyBytes))
+		return nil, fmt.Errorf("upload: %w", parseHTTPErrorWithHeader(resp.StatusCode, bodyBytes, resp.Header))
 	}
 
 	var result struct {
@@ -1648,13 +1709,19 @@ func (c *Client) doJSONFullInternal(ctx context.Context, method, path string, bo
 		return nil, err
 	}
 
-	var bodyReader io.Reader
+	// L6 (v0.15): 序列化 body 为 []byte 以便重试时重 wrap reader.
+	var bodyBytes []byte
 	if body != nil {
 		data, err := json.Marshal(body)
 		if err != nil {
 			return nil, fmt.Errorf("marshal request: %w", err)
 		}
-		bodyReader = bytes.NewReader(data)
+		bodyBytes = data
+	}
+
+	var bodyReader io.Reader
+	if bodyBytes != nil {
+		bodyReader = bytes.NewReader(bodyBytes)
 	}
 
 	req, err := http.NewRequestWithContext(ctx, method, c.apiURL(path), bodyReader)
@@ -1666,7 +1733,7 @@ func (c *Client) doJSONFullInternal(ctx context.Context, method, path string, bo
 		req.Header.Set("Content-Type", "application/json")
 	}
 
-	resp, err := c.http.Do(req)
+	resp, err := c.doRequestWithRetry(req, bodyBytes)
 	if err != nil {
 		return nil, fmt.Errorf("request %s %s: %w", method, path, err)
 	}
@@ -1682,7 +1749,7 @@ func (c *Client) doJSONFullInternal(ctx context.Context, method, path string, bo
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorBodySize))
-		return nil, parseHTTPError(resp.StatusCode, bodyBytes)
+		return nil, parseHTTPErrorWithHeader(resp.StatusCode, bodyBytes, resp.Header)
 	}
 
 	if result != nil {
@@ -1698,28 +1765,168 @@ func (c *Client) doJSONFullInternal(ctx context.Context, method, path string, bo
 	return resp.Header, nil
 }
 
+// doRequest 是 c.http.Do 的统一包装 — 错误经 classifyTransport 转 *NetworkError.
+//
+// L6 V2 P1 (2026-04-27, v0.15): 6 处原始 c.http.Do(req) 全部走此 helper, 给后续 L6 retry policy
+// 提供统一可分类的错误源. SDK 内部统一调用点; 老调用方调 c.http.Do 直接也能编译, 但 err 不分类.
+func (c *Client) doRequest(req *http.Request) (*http.Response, error) {
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, classifyTransport(req.Method+" "+req.URL.Path, req.URL.String(), err)
+	}
+	return resp, nil
+}
+
+// doRequestWithRetry 带 RetryPolicy 的 doRequest 包装 — 仅用于同步 (非流式) 路径.
+//
+// L6 (v0.15): 内部对 SafeToRetry+OnRetryable 闸门评估, 不通过则单次调 doRequest.
+//
+// 重试触发:
+//   - transport 层 err (NetworkError Timeout/EOF) → 重试
+//   - HTTP 5xx / 429 → 主动构造 *HTTPError 喂给 OnRetryable, 默认重试
+//   - 其他 (HTTP 2xx/3xx/4xx 非 429 / DNS / *StreamError) → 不重试
+//
+// 参数 bodyBytes 必须传 (即使 nil) — 用于重试时重新构造 Body reader.
+// req.Body 调用本函数前应当为 nil 或预读完毕; 函数内部会 reset.
+//
+// 流式路径 (chatMessagesStreamInternal / chatStreamInternal) **不得**调用此函数, 必须直接用 doRequest.
+// 流式重试 = 双 token + 重复消息 (V2 P0 *StreamError 已通过 OnRetryable 显式排除, 但流路径还需路径层硬编码 bypass).
+//
+// 返回的 resp 可能 body 已被消费 (5xx 重试探测时已读); caller 必须处理 nil resp 时的错误.
+func (c *Client) doRequestWithRetry(req *http.Request, bodyBytes []byte) (*http.Response, error) {
+	policy := c.retryPolicy
+	// nil policy 或 SafeToRetry 不通过 → 直接走单次 (老路径, 0 行为变化)
+	if policy == nil || !policy.SafeToRetry(req) {
+		return c.doRequest(req)
+	}
+
+	var lastErr error
+	for attempt := 0; attempt < policy.MaxAttempts; attempt++ {
+		// 重置 body (除首次外)
+		if attempt > 0 && bodyBytes != nil {
+			req.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+		}
+
+		resp, err := c.doRequest(req)
+
+		// 探测 HTTP 状态: 仅 5xx/429 才进 retry 评估; 2xx/3xx/4xx 直接返回 caller
+		// 注: 这里若 5xx 进入 retry, body 必须读完释放连接 (defer Close 也需要)
+		if err == nil && resp != nil {
+			if resp.StatusCode < 500 && resp.StatusCode != http.StatusTooManyRequests {
+				return resp, nil // 成功 / 客户端业务错误 → caller 处理
+			}
+			// 5xx 或 429 → 进 retry 评估
+			bodyPeek, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorBodySize))
+			resp.Body.Close()
+			err = parseHTTPErrorWithHeader(resp.StatusCode, bodyPeek, resp.Header)
+		}
+
+		lastErr = err
+
+		// 最后一次不再重试
+		if attempt+1 == policy.MaxAttempts {
+			break
+		}
+
+		if !policy.OnRetryable(err) {
+			break
+		}
+
+		// 退避 — Retry-After 优先 (HTTPError) > 指数退避
+		backoff := computeBackoff(policy, attempt, err)
+		select {
+		case <-req.Context().Done():
+			return nil, req.Context().Err()
+		case <-time.After(backoff):
+		}
+	}
+	return nil, lastErr
+}
+
+// classifyTransport 包装 c.http.Do 返回的 err 为 *NetworkError, 便于 L6 retry policy 判定.
+//
+// 分类规则 (按优先级):
+//   - ctx.DeadlineExceeded / err.Timeout() 为 true → Timeout=true
+//   - errors.Is(io.EOF) / "unexpected EOF" / "connection reset" → EOF=true
+//   - 其他: Timeout/EOF 都 false (不重试)
+//
+// op 描述用于 Error() 输出 (e.g. "POST /v1/messages"); url 用于错误定位 (脱敏由调用方负责).
+// 文案兼容: NetworkError.Error() 包含 cause.Error() 原文, 老 fmt.Errorf 风格调用方字符串匹配仍工作.
+func classifyTransport(op, urlStr string, err error) *NetworkError {
+	if err == nil {
+		return nil
+	}
+	ne := &NetworkError{
+		Op:    op,
+		URL:   urlStr,
+		Cause: err,
+	}
+	// Timeout 检测: ctx.DeadlineExceeded + net.Error.Timeout()
+	if errors.Is(err, context.DeadlineExceeded) {
+		ne.Timeout = true
+		return ne
+	}
+	type timeoutErr interface{ Timeout() bool }
+	var te timeoutErr
+	if errors.As(err, &te) && te.Timeout() {
+		ne.Timeout = true
+		return ne
+	}
+	// EOF 检测: io.EOF + 字符串匹配 (跨平台 darwin/linux 兼容, 不用 syscall.ECONNRESET)
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		ne.EOF = true
+		return ne
+	}
+	msg := err.Error()
+	if strings.Contains(msg, "EOF") || strings.Contains(msg, "connection reset") || strings.Contains(msg, "broken pipe") {
+		ne.EOF = true
+	}
+	return ne
+}
+
 // parseHTTPError 解析 HTTP 错误响应体，兼容 Anthropic 和 OpenAI 错误格式
 // Anthropic: {"type":"error","error":{"type":"...","message":"..."}}
 // OpenAI:    {"error":{"message":"...","type":"...","code":"..."}}
 // 通用回退: HTTP {status}: {body}
+//
+// L6 V2 P1 (2026-04-27, v0.15): 改返回 *HTTPError 结构化错误, 调用方可 errors.As 提取.
+// 文案兼容承诺: Error() 字符串与老 fmt.Errorf 输出一致, 老调用方字符串匹配 0 破坏.
 func parseHTTPError(statusCode int, body []byte) error {
+	return parseHTTPErrorWithHeader(statusCode, body, nil)
+}
+
+// parseHTTPErrorWithHeader 同 parseHTTPError 但额外解析 Retry-After 头到 HTTPError.RetryAfter.
+// L6 retry policy 用此字段做指数退避降级.
+func parseHTTPErrorWithHeader(statusCode int, body []byte, header http.Header) error {
+	he := &HTTPError{
+		StatusCode: statusCode,
+		Body:       string(body),
+	}
+	// Retry-After 头: 仅支持 "120" 秒形式 (HTTP 日期形式罕见, 暂不支持)
+	if header != nil {
+		if ra := header.Get("Retry-After"); ra != "" {
+			if sec, err := strconv.Atoi(ra); err == nil && sec > 0 {
+				he.RetryAfter = sec
+			}
+		}
+	}
 	if len(body) == 0 {
-		return fmt.Errorf("HTTP %d", statusCode)
+		return he
 	}
 	var obj map[string]interface{}
 	if json.Unmarshal(body, &obj) == nil {
 		// Anthropic 格式: {"type":"error","error":{"type":"...","message":"..."}}
+		// OpenAI 格式:    {"error":{"message":"...","type":"...","code":"..."}}
 		if errObj, ok := obj["error"].(map[string]interface{}); ok {
 			if msg, ok := errObj["message"].(string); ok {
-				errType, _ := errObj["type"].(string)
-				if errType != "" {
-					return fmt.Errorf("HTTP %d: [%s] %s", statusCode, errType, msg)
-				}
-				return fmt.Errorf("HTTP %d: %s", statusCode, msg)
+				he.Message = msg
+			}
+			if errType, ok := errObj["type"].(string); ok {
+				he.Type = errType
 			}
 		}
 	}
-	return fmt.Errorf("HTTP %d: %s", statusCode, string(body))
+	return he
 }
 
 // 根因修复 #3: doJSON 增加 retried 参数, 401 重试只允许一次, 防无限递归栈溢出
@@ -1740,13 +1947,19 @@ func (c *Client) doPublicJSON(ctx context.Context, method, path string, body int
 
 	token, _ := c.ensureToken(ctx)
 
-	var bodyReader io.Reader
+	// L6 (v0.15): 序列化 body 为 []byte 以便重试时重 wrap reader.
+	var bodyBytes []byte
 	if body != nil {
 		data, err := json.Marshal(body)
 		if err != nil {
 			return fmt.Errorf("marshal request: %w", err)
 		}
-		bodyReader = bytes.NewReader(data)
+		bodyBytes = data
+	}
+
+	var bodyReader io.Reader
+	if bodyBytes != nil {
+		bodyReader = bytes.NewReader(bodyBytes)
 	}
 
 	req, err := http.NewRequestWithContext(ctx, method, c.apiURL(path), bodyReader)
@@ -1760,7 +1973,7 @@ func (c *Client) doPublicJSON(ctx context.Context, method, path string, body int
 		req.Header.Set("Content-Type", "application/json")
 	}
 
-	resp, err := c.http.Do(req)
+	resp, err := c.doRequestWithRetry(req, bodyBytes)
 	if err != nil {
 		return fmt.Errorf("request %s %s: %w", method, path, err)
 	}
@@ -1768,7 +1981,7 @@ func (c *Client) doPublicJSON(ctx context.Context, method, path string, body int
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorBodySize))
-		return parseHTTPError(resp.StatusCode, bodyBytes)
+		return parseHTTPErrorWithHeader(resp.StatusCode, bodyBytes, resp.Header)
 	}
 
 	if result != nil {

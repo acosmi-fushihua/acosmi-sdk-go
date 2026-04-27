@@ -1,0 +1,98 @@
+# Release 工作流 — 跨平台构建 CrabClaw-Skill CLI 二进制并创建 GitHub Release
+#
+# 触发方式 (仅手动, 节省 Actions 额度):
+#   - GitHub UI: Actions → Release → Run workflow → 填 tag → 点 Run
+#   - CLI: gh workflow run release.yml -f tag=v0.14.0
+#
+# 不使用 push:tags 自动触发的原因:
+#   - 每次 tag push 都会消耗 Actions 计算时间;
+#   - 文档/小修等 tag 不一定都需要重新构建 release;
+#   - 版本/手动控制更稳, 出错可单点重跑。
+#
+# 流程:
+#   1. checkout 指定 tag (兼容 main HEAD)
+#   2. setup Go 1.22
+#   3. make build-all (5 个 OS/arch 组合产出到 dist/)
+#   4. 创建/更新对应 tag 的 GitHub Release, 上传 dist/* binary
+#
+# 后续: 用户可手动 cd npm && npm publish --access public 把 npm 包推到 registry,
+# postinstall.js 会从此 Release 下载对应平台 binary。
+
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '要发布的 git tag (例: v0.14.0)。tag 必须已经 push 到 origin。'
+        required: true
+        type: string
+      prerelease:
+        description: '是否标记为 prerelease (alpha/beta/rc)'
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write  # 创建 Release + 上传 asset 需要
+
+    steps:
+      - name: Checkout tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag }}
+          fetch-depth: 0  # build 期间 git describe 需要完整历史
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          cache: true
+
+      - name: Verify tag exists
+        run: |
+          set -e
+          if ! git rev-parse "${{ github.event.inputs.tag }}" >/dev/null 2>&1; then
+            echo "::error::tag '${{ github.event.inputs.tag }}' 不存在, 请先 git tag + push"
+            exit 1
+          fi
+          echo "tag verified: ${{ github.event.inputs.tag }}"
+
+      - name: Build all platforms
+        run: |
+          make build-all
+          echo "── dist/ ──"
+          ls -lh dist/
+
+      - name: Create/Update GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          TAG="${{ github.event.inputs.tag }}"
+          PRE_FLAG=""
+          if [ "${{ github.event.inputs.prerelease }}" = "true" ]; then
+            PRE_FLAG="--prerelease"
+          fi
+
+          # 已存在则上传新 asset (覆盖); 否则创建
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG 已存在, 上传/覆盖 binary..."
+            gh release upload "$TAG" dist/* --clobber
+          else
+            echo "创建新 Release $TAG..."
+            gh release create "$TAG" \
+              --title "$TAG" \
+              --notes "由 workflow_dispatch 手动触发构建。详细变更见 docs/guide.md § 12 版本记录。" \
+              $PRE_FLAG \
+              dist/*
+          fi
+
+      - name: Summary
+        run: |
+          echo "✓ Release $TAG 已就绪"
+          echo "   下游: cd npm && npm publish --access public"
+          echo "   或: go get github.com/acosmi/acosmi-sdk-go@${{ github.event.inputs.tag }}"

@@ -1,6 +1,6 @@
 # Acosmi Go SDK 开发手册
 
-> v0.14.0 | Go 1.22+ | MIT
+> v0.15.1 | Go 1.22+ | MIT
 
 ## 目录
 
@@ -158,13 +158,16 @@ type TokenStore interface {
 
 ```go
 client, err := acosmi.NewClient(acosmi.Config{
-    ServerURL:  "",                   // 零值 → https://acosmi.com (默认); 国际站传 https://acosmi.ai
-    Store:      nil,                  // 默认 ~/.acosmi/tokens.json
-    HTTPClient: nil,                  // 默认无全局超时 (避免截断 SSE 流)
+    ServerURL:   "",                       // 零值 → https://acosmi.com (默认); 国际站传 https://acosmi.ai
+    Store:       nil,                      // 默认 ~/.acosmi/tokens.json
+    HTTPClient:  nil,                      // 默认无全局超时 (避免截断 SSE 流)
+    RetryPolicy: acosmi.DefaultRetryPolicy, // v0.15+: 重试策略, nil = 禁用 (老行为)
 })
 ```
 
 > `HTTPClient` 不设全局 `Timeout` 是有意为之 — 全局超时会截断流式聊天。通过 `context.Context` 控制超时。
+
+> **v0.15+ RetryPolicy** (opt-in, 0 破坏性): 启用后 GET 类查询自动 2x retry, **POST chat/messages 仍 0 retry** (计费安全). 详见 [§ 12 v0.15 段](#12-版本记录).
 
 ### 4.2 授权
 
@@ -203,6 +206,38 @@ client.LoginWithHandler(ctx, "CrabCode Desktop", acosmi.AllScopes(),
 `LoginErrCode` 分类码: `discovery_failed` / `registration_failed` / `browser_open_failed` / `auth_denied` / `auth_timeout` / `token_exchange_failed` / `ssl_proxy_detected`。
 
 其他 `LoginOption`: `WithLoginHint("user@org.com")` SSO email 预填 / `WithLoginMethod("sso")` / `WithOrgUUID(uuid)` 强制组织登录 / `WithExpiresIn(3600)` 自定义 token 有效期。
+
+#### 并发授权语义 (v0.15.1+)
+
+`ensureToken` 是所有 API 方法 (含 WebSocket / SSE / 商城 / 钱包) 的内部 token 闸门。v0.15.1 起按**三态**语义工作，启动期 fan-out 调用不再误报：
+
+| 状态 | 行为 | 错误信息 |
+|---|---|---|
+| Token 已就绪 | 立即放行 | — |
+| Token=nil + Login 进行中 | **阻塞等待**直至 token 就绪或 ctx 超时 | (成功或 `waiting for token: <ctx err>`) |
+| Token=nil + Login 未启动 | **fail-fast** (保留旧行为) | `not authorized, call Login() first` |
+
+**适用场景**:
+
+```go
+client, _ := acosmi.NewClient(acosmi.Config{...})
+
+// 推荐用法: Login 与 API 调用可并发触发, 无需手动同步
+go client.Login(ctx, "MyApp", acosmi.AllScopes())  // 异步开浏览器
+
+// 以下并发调用全部安全 — Login 完成后统一放行, 0 条 "not authorized" 误报
+go client.ListModels(ctx)        // 等待 → 拿到 token → 200
+go client.GetBalance(ctx)        // 等待 → 拿到 token → 200
+go client.WSConnect(ctx)         // 等待 → 拿到 token → 升级握手
+```
+
+**红线**:
+1. 调用方未触发 Login 即调 API → 立即返 `call Login() first` (与 v0.15.0 行为一致, 错误信息保留)
+2. Login 进行中但 ctx 先超时 → 返 `waiting for token: context deadline exceeded` (`errors.Is(err, context.DeadlineExceeded)` 链兼容)
+3. 公共端点 (`doPublicJSON`) 仍以"匿名兜底"调用 ensureToken 并忽略错误 — 未授权时走匿名路径，行为不变
+4. Logout 后 fail-fast 立即生效；下一次 Login 重新触发等待→唤醒流程
+
+> **修复背景**: v0.15.0 及之前 `ensureToken` 仅有"nil → 立即报错 / 有效 → 返回"二态机, 启动期 4 个并发 fan-out 调用 (ws / ListModels / GetBalance / harness handshake) 各自报 `not authorized` WARN 而非协同等待 Login 完成。v0.15.1 加入 `tokenReady` channel + `loginInFlight` 标志解决该问题；已授权场景零额外开销 (channel 已 close)。
 
 ### 4.3 AI 模型服务
 
@@ -590,6 +625,109 @@ if caps.SupportsDeepThinking {
     req.Thinking = acosmi.NewThinkingConfig(acosmi.ThinkingMax)
 }
 ```
+
+#### DeepSeek-anthropic 接入 (Gateway 2026-04-27+)
+
+DeepSeek 在标准 Anthropic 兼容端点 (`/anthropic/v1/messages`) 上扩展了三个**私有字段**控制思考 / JSON 输出, 这些字段不属于 Anthropic-official 协议:
+
+| DeepSeek 字段 | 形态 | 用途 |
+|---|---|---|
+| `thinking` | `{"type":"enabled"\|"disabled"}` | 思考开关 |
+| `output_config` | `{"effort":"high"\|"max"}` | 思考强度 (low/medium → high; xhigh → max) |
+| `response_format` | `{"type":"json_object"}` | JSON Output |
+
+**网关闸门**: 仅 `deepseek_anthropic_v1` profile 的 capability preset 声明 `SupportsOutputConfig=true` + `SupportsResponseFormat=true`; 其他 Anthropic-wire provider (Anthropic-official / DashScope-anthropic / Zhipu-anthropic / OpenRouter / third-party) 由 sanitizer 自动剥除这些字段, 防 400。
+
+##### ⚠️ SDK 高级 API 在 DeepSeek-anthropic 上的语义局限
+
+| SDK 入参 | AnthropicAdapter 实际写入 body | DeepSeek 期望 | 结果 |
+|---|---|---|---|
+| `Thinking.Level=ThinkingMax` | `thinking:{type:"adaptive"}` + 顶层 `effort:{level:"max"}` | `thinking:{type:"enabled"}` + `output_config:{effort:"max"}` | ❌ DeepSeek 不识别顶层 `effort` 键, 深度档位静默退化 |
+| `OutputConfig{Format:"json_object"}` | `output_config:{format:"json_object"}` | `response_format:{type:"json_object"}` | ❌ 同名键 (`output_config`) 但内嵌 schema 不同, JSON Output 失效 |
+| `Thinking.Level=ThinkingOff` | `thinking:{type:"disabled"}` | 同左 | ✅ 直通 |
+
+> SDK 高级 API 是为 Claude 原生模型设计的; DeepSeek-anthropic 是 v0.13.x 的覆盖盲区, 计划 v0.14 引入 provider-aware adapter 自动翻译。在那之前请用下面的 compat 模式。
+
+##### ✅ 推荐接入: compat 模式 + 原始字段直发
+
+下游 (例如 CrabCode 的"关闭/标注/深度"思考开关) 直接构造 DeepSeek 期望的字段形态:
+
+```go
+// 用户在 UI 选择思考档位
+var thinkingType, effort string
+switch userChoice {
+case "关闭":
+    thinkingType, effort = "disabled", ""
+case "标注":
+    thinkingType, effort = "enabled", "high"
+case "深度":
+    thinkingType, effort = "enabled", "max"
+}
+
+// MaxTokens 按档位选: 关闭=8192 / 标注=30000 / 深度=100000 (含思考 + answer)
+maxTokens := 8192
+switch userChoice {
+case "标注":
+    maxTokens = 30000
+case "深度":
+    maxTokens = 100000
+}
+
+req := &acosmi.ChatRequest{
+    Messages:  msgs,
+    MaxTokens: maxTokens,
+    // 不用 Thinking.Level (高级 API), 直接 compat 模式手填字段
+    Thinking: &acosmi.ThinkingConfig{Type: thinkingType},
+    ExtraBody: map[string]any{
+        // DeepSeek 私有字段, AnthropicAdapter 在 body 末尾覆盖任何 typed 字段
+        "output_config":   map[string]any{"effort": effort}, // 关闭档可省略
+        "response_format": map[string]any{"type": "json_object"}, // 仅需 JSON Output 时
+    },
+}
+```
+
+**关键点**:
+
+- **不要设 `req.Thinking.Level`**: 一旦设了, SDK 会接管 `thinking` / `effort` / `max_tokens` 三键, 在 DeepSeek 上语义错位。
+- **不要设 `req.OutputConfig`**: SDK 会写 `output_config:{format,schema}` 形态, 与 DeepSeek 期望的 `{effort:...}` 键冲突 (同名异构)。
+- **`ExtraBody` 在 adapter 末尾覆盖**: 即使你同时设了 `OutputConfig`, ExtraBody 里的 `output_config` 仍会胜出 (`adapter_anthropic.go:102-104`)。
+- **ResponseFormat 通道 (Gateway 2026-04-27+)**: 后端 `AnthropicProxyRequest` 已加 `response_format` 字段绑定 + 专属 `adaptAnthropicDeepSeek` 适配器写入 body, 不再被 Gin 静默丢弃。
+
+##### 思考开关三档完整示例
+
+```go
+// 关闭思考: 仅传 thinking
+req := &acosmi.ChatRequest{
+    Messages:  msgs,
+    MaxTokens: 8192, // 8K — 关闭思考时全额给 answer, 留足空间防代码/长答截断
+    Thinking:  &acosmi.ThinkingConfig{Type: "disabled"},
+}
+
+// 标注思考: thinking=enabled + effort=high
+req := &acosmi.ChatRequest{
+    Messages:  msgs,
+    MaxTokens: 30000, // 30K — 标准思考档位常用值
+    Thinking:  &acosmi.ThinkingConfig{Type: "enabled"},
+    ExtraBody: map[string]any{
+        "output_config": map[string]any{"effort": "high"},
+    },
+}
+
+// 深度思考 + JSON Output: 三字段全开
+req := &acosmi.ChatRequest{
+    Messages:  msgs,
+    MaxTokens: 100000, // 100K — 深度思考 + JSON 输出共享额度, 含思考链 + answer
+    Thinking:  &acosmi.ThinkingConfig{Type: "enabled"},
+    ExtraBody: map[string]any{
+        "output_config":   map[string]any{"effort": "max"},
+        "response_format": map[string]any{"type": "json_object"},
+    },
+}
+```
+
+> `max_tokens` 是响应总额度 (思考 block + 文本 block + tool_use 全部计入), 不是单独的"思考长度"。DeepSeek 1M context / 300K+ output 上限非常宽松, 上述三档 (8K/30K/100K) 是体验/成本平衡点; 若 schema 复杂或 answer 长, 自行按需上调防截断。
+>
+> JSON Output 注意 (DeepSeek 文档): system / user prompt 必须含 "json" 字样并给出输出样例; `max_tokens` 要够防截断; 偶发返回空 content (网关已用 `KindEmptyResponse` 兜底重试)。
 
 #### 同 model_id 多 wireFormat 共存 (Gateway 2026-04-26+)
 
@@ -1283,7 +1421,30 @@ func ParseNotificationEvent(ev WSEvent) *Notification // 返回 nil 表示非通
 ### 错误
 
 ```go
+// HTTPError: HTTP 非 2xx 业务错误 (v0.15+, 替代老 fmt.Errorf 字符串错误)
+// parseHTTPError 现返回 *HTTPError, 自动解析 Anthropic/OpenAI 双格式 + Retry-After 头
+type HTTPError struct {
+    StatusCode int    // HTTP 状态码
+    Type       string // anthropic.error.type / openai.error.type, 缺失为空
+    Message    string // 错误消息
+    RetryAfter int    // Retry-After 头解析的秒数, 0 表示未提供
+    Body       string // 原始响应体 (截断到 1MB)
+}
+// Error() 文案与老 fmt.Errorf 完全一致: "HTTP %d: [%s] %s" / "HTTP %d: %s" / "HTTP %d"
+
+// NetworkError: 传输层错误 (v0.15+, 包装 c.http.Do 返回的 timeout/EOF/connection refused 等)
+type NetworkError struct {
+    Op      string // 操作描述, e.g. "POST /v1/messages"
+    URL     string
+    Cause   error  // 原始 net 错误
+    Timeout bool   // ctx.DeadlineExceeded / net.Error.Timeout()
+    EOF     bool   // io.EOF / "unexpected EOF" / "connection reset"
+}
+// Unwrap() error → 支持 errors.Is 链匹配原始 cause
+// IsTimeout() bool / IsEOF() bool — L6 retry policy 用此判定可重试性
+
 type RateLimitError struct { Message, RetryAfter, Raw string }
+// 注: RateLimitError 仅 DownloadSkill 匿名下载链路使用 (兼容历史). 其他 429 路径用 *HTTPError + RetryAfter int 字段.
 
 // BusinessError: API 业务层错误 (HTTP 200 但 code != 0, tk-dist 代理透传 yudao 响应)
 type BusinessError struct { Code int; Message string }
@@ -1292,15 +1453,22 @@ type BusinessError struct { Code int; Message string }
 // WaitForPayment 在终态非成功时返回
 type OrderTerminalError struct { OrderID, Status string }
 
-// HTTP 错误统一解析 (parseHTTPError):
-// Anthropic: {"type":"error","error":{"type":"...","message":"..."}} → "HTTP 400: [invalid_request_error] ..."
-// OpenAI:    {"error":{"message":"..."}}                            → "HTTP 400: ..."
-// 其他:      原始响应体                                               → "HTTP 400: {raw body}"
-// 所有 Chat/ChatMessages/ChatStream 等方法均使用此统一解析
-
-// 类型断言示例
+// 类型断言示例 (v0.15+ 推荐先 HTTPError/NetworkError, 老 RateLimitError/BusinessError 仍兼容)
+var he *acosmi.HTTPError
+if errors.As(err, &he) {
+    if he.StatusCode == 429 && he.RetryAfter > 0 {
+        time.Sleep(time.Duration(he.RetryAfter) * time.Second)
+    } else if he.StatusCode == 401 {
+        // 重新登录...
+    }
+}
+var ne *acosmi.NetworkError
+if errors.As(err, &ne) {
+    if ne.IsTimeout() { /* 超时, 可考虑重试 */ }
+    if ne.IsEOF() { /* 连接断开, 可考虑重试 */ }
+}
 var rateErr *acosmi.RateLimitError
-if errors.As(err, &rateErr) { /* 限流 */ }
+if errors.As(err, &rateErr) { /* 下载链路限流 (DownloadSkill) */ }
 var bizErr *acosmi.BusinessError
 if errors.As(err, &bizErr) { fmt.Printf("业务错误 code=%d: %s\n", bizErr.Code, bizErr.Message) }
 var termErr *acosmi.OrderTerminalError
@@ -1560,6 +1728,197 @@ make install    # → $GOPATH/bin
 ## 12. 版本记录
 
 > 本节只保留 SDK 使用者最需要关心的兼容点与破坏性变更。更细的网关实现背景、审计过程和分阶段交付记录，建议查主仓架构文档。
+
+### v0.15.1 (2026-04-27) — `ensureToken` 三态等待 (启动期并发修复)
+
+> **Bug fix (0 破坏性)**: `ensureToken` 引入"等待 Login 就绪"中间态, 修复启动期 fan-out 调用的 `not authorized` 误报。已授权场景零额外开销, 未授权场景错误信息保留。
+
+**根因**: v0.15.0 及之前 `ensureToken` 仅有 nil → 立即报错 / 有效 → 返回 二态机。启动期同时触发 `Login` + 多个 API 调用 (CrabClaw 典型 fan-out: ws / ListModels / GetBalance / harness handshake) 各自命中 `c.tokens == nil` 立即报 `not authorized, call Login() first`, 4 条无效 WARN。
+
+**修复**: 新增 `tokenReady chan` + `loginInFlight bool` + `tokenOnce sync.Once`:
+- `loginInternal` 入口锁内置 `loginInFlight=true`, 完成后 `tokenOnce.Do(close(tokenReady))`, defer 翻 false
+- `Logout` 锁内重置 `tokenReady = make(chan)` + `tokenOnce = sync.Once{}`
+- `ensureToken` 锁内三快照 (tokens / ready / inFlight), 按 §4.2 三态语义分流
+
+**对调用方可见面**:
+- 已授权场景: tokenReady 已 close, 立即放行, 零额外开销 (无新分配/无锁等待)
+- Login 并发场景: 自动等待至 token 就绪, 不再 4 条 WARN
+- 未授权场景: 错误信息保留 `call Login() first` (调用方 fail-fast 行为不变)
+- ctx 超时: 返 `waiting for token: context deadline exceeded`, `errors.Is(err, context.DeadlineExceeded)` 链兼容
+
+**API 兼容**: 公共方法签名 0 改动 (Login / Logout / IsAuthorized / GetTokenSet / 所有业务 API)。Tauri/Rust wrapper 字符串匹配 0 破坏。
+
+**测试**: 新增 7 个回归用例 (`ensure_token_wait_test.go`) — fail-fast / 4 并发等待 / ctx 提前到期 / 预加载零等待 / Logout 重置链路 / Login+Logout race (50 轮压测) / 等待中 Logout 边界。`go test -race -count=1 ./...` 全绿。
+
+**深度审计修正** (实施期): 复核发现 step 5 close 在 `c.mu.Unlock` 后裸读 `c.tokenOnce` / `c.tokenReady`, 与 Logout 锁内重置构成 data race (race detector 必抓)。修复方式: 把 `tokenOnce.Do(close)` 收进同一把 Lock, 与 `c.tokens = tokens` 合并临界区。
+
+> 完整三态语义与红线见 [§4.2 并发授权语义](#42-授权)。
+
+### v0.15 (2026-04-27) — L6 SDK retry policy + V2 P1 错误类型化
+
+> **新功能 (opt-in, 0 破坏性)**: SDK 端引入 `RetryPolicy` 与结构化错误类型 `HTTPError` / `NetworkError`. **默认配置 `RetryPolicy: nil` 退化到 v0.14.1 行为**, 升级到 v0.15 后老调用方零行为变化.
+>
+> **计费安全红线**: `defaultSafeToRetry` POST/PUT/DELETE/PATCH 默认 `false`, chat/messages/upload POST **永不重试** (双扣绝不发生); 仅 GET/HEAD/OPTIONS 默认享受 2x retry. 详见下文.
+
+#### V2 P1 — 结构化错误类型 (`*HTTPError` + `*NetworkError`)
+
+老 `parseHTTPError` 返回 `fmt.Errorf("HTTP %d: %s", ...)` 字符串错误, `errors.As` 出不来分类. 网络层 `c.http.Do` 错误 (timeout/EOF/connection reset) 直接 `*net.OpError` 透传, 无统一封装. v0.15 加结构化包装:
+
+```go
+// HTTPError - 5xx/4xx 业务错误
+var he *acosmi.HTTPError
+if errors.As(err, &he) {
+    if he.StatusCode == 429 && he.RetryAfter > 0 {
+        time.Sleep(time.Duration(he.RetryAfter) * time.Second)
+    }
+}
+
+// NetworkError - 传输层 (timeout/EOF/connection refused)
+var ne *acosmi.NetworkError
+if errors.As(err, &ne) {
+    if ne.IsTimeout() { /* 超时重试逻辑 */ }
+    if ne.IsEOF() { /* 连接断开 */ }
+}
+```
+
+**字段集**:
+- `HTTPError`: `StatusCode int / Type string / Message string / RetryAfter int (秒) / Body string`
+- `NetworkError`: `Op string / URL string / Cause error / Timeout bool / EOF bool` + `Unwrap() error` (`errors.Is` 链兼容)
+
+**文案兼容承诺**: `Error()` 输出与老 `fmt.Errorf` 完全一致 (`HTTP %d: [%s] %s` / `HTTP %d: %s` / `HTTP %d` 三态). Tauri/Rust wrapper 字符串匹配 0 破坏.
+
+**SDK 内部改动** (v0.15 已集成, 调用方透明):
+- `parseHTTPError` 改返回 `*HTTPError` (新增 `parseHTTPErrorWithHeader` 自动解析 `Retry-After` 头)
+- `c.doRequest(req)` helper 包装 `c.http.Do` 错误为 `*NetworkError` (`classifyTransport` 分类 ctx.DeadlineExceeded / io.EOF / "connection reset" / `net.Error.Timeout()`)
+- 7 处 `parseHTTPError` 调用全部升级用 `parseHTTPErrorWithHeader` 接 `resp.Header`
+- 6 处 `c.http.Do` 调用全部走 `c.doRequest` (chatStream / DownloadSkill / UploadSkill / doJSONFullInternal / doPublicJSON 等)
+
+#### L6 — RetryPolicy
+
+```go
+client, _ := acosmi.NewClient(acosmi.Config{
+    ServerURL:   "https://acosmi.com",
+    RetryPolicy: acosmi.DefaultRetryPolicy, // 启用 — chat 类 POST 仍 0 retry, GET 类得 2x 稳定性
+    // 或: RetryPolicy: nil — 禁用, 退化到 v0.14.1 行为
+})
+```
+
+**`DefaultRetryPolicy` 字段**:
+
+| 字段 | 默认值 | 含义 |
+|---|---|---|
+| `MaxAttempts` | 2 | 总尝试次数 (含首次); 1 = 不重试 |
+| `Backoff` | 200ms | 首次重试退避 |
+| `BackoffMax` | 2s | 退避封顶 |
+| `BackoffMul` | 2.0 | 指数倍数 (200ms → 400ms → 800ms → 1.6s → 2s cap) |
+| `OnRetryable` | `defaultRetryable` | 错误层闸门 |
+| `SafeToRetry` | `defaultSafeToRetry` | 请求层闸门 — **计费安全红线** |
+
+**`defaultSafeToRetry` 判定** (计费安全):
+
+| Method | 默认 | 说明 |
+|---|---|---|
+| GET / HEAD / OPTIONS | `true` | 天然幂等 |
+| POST / PUT / DELETE / PATCH | `false` | 双扣保护 — chat/messages/upload 永不重试 |
+
+> 自定义 `SafeToRetry` 可对特定只读 POST 端点放行, 但**严禁**让 chat/messages POST 通过, 否则双扣.
+
+**`defaultRetryable` 判定** (错误层):
+
+```
+*StreamError       → false (V2 P0 流已部分写出, 重试 = 双 token + 重复消息)
+context.Canceled   → false (用户主动 abort)
+*HTTPError 5xx/429 → true
+*NetworkError IsTimeout()/IsEOF() → true
+其他 (4xx/DNS/未知) → false
+```
+
+**Retry-After 头优先**: HTTPError 含 `RetryAfter > 0` 时, 退避用 `Retry-After` 秒数 (硬上限 60s 防恶意服务器卡死), 否则走指数退避.
+
+**红线 (硬保证)**:
+1. POST 默认 SafeToRetry=false → chat/messages 用户**0 行为变化**
+2. Stream 路径 (`chatStream` / `chatMessagesStream`) **不调用** retry helper, 流式重试不存在
+3. `*StreamError` 经 `OnRetryable` 显式排除
+4. `ctx.Canceled` (用户 Ctrl+C) 立即返回, 不重试
+5. 401 refresh 是 inner loop, **不算 attempt** (refresh 后重进 retry 顶)
+6. 已 wrap fmt.Errorf 的 caller 通过 `errors.As` 仍可解开 `HTTPError` / `NetworkError`
+
+**生效面**:
+
+| 路径 | 是否走 `doRequestWithRetry` | retry 实际触发 |
+|---|---|---|
+| `doJSONFullInternal` (POST/GET 通用) | ✅ | GET 类 5xx/429 (POST SafeToRetry=false 单次) |
+| `doPublicJSON` (匿名/公共端点) | ✅ | GET 类 5xx/429 |
+| `UploadSkill` (POST multipart) | ✅ | **永不重试** (POST SafeToRetry=false), 升级仅为统一调用模式 + 错误类型化 |
+| `chatStream` / `chatMessagesStream` (SSE) | ❌ | 流式硬编码绕过, 重试 = 双 token |
+| `DownloadSkill` (GET 大文件) | ❌ | 老路径保留 `*RateLimitError` 兼容 (类型不一致风险), 不升级 |
+
+**回退**: `Config{RetryPolicy: nil}` 即退化到 v0.14.1 行为.
+
+### v0.13.x 服务端 (2026-04-27) — DeepSeek-anthropic 三参数闭环
+
+> 网关侧 capability 闸门 + `/anthropic` 端 `response_format` 通道修补, 对 SDK 用户**0 破坏性变更**. SDK 自身代码 0 改动, 仅文档 (`§4.3 DeepSeek-anthropic 接入`) 增加 compat 模式接入指南.
+
+**根因**: DeepSeek 在 Anthropic 兼容端点扩展三个私有字段 (`thinking` / `output_config.effort` / `response_format`). 修补前 `response_format` 在 `AnthropicProxyRequest.ShouldBindJSON` 阶段被 Gin 静默丢弃, 即使 SDK 通过 ExtraBody 注入也到不了上游。
+
+**网关改动** (commit 待提交):
+- `gateway/capability/capability.go` 新增 `SupportsOutputConfig` / `SupportsResponseFormat` 字段
+- `gateway/sanitizer/headers.go` 按 capability 闸门剥除不支持 provider 的字段, 防 400
+- `presets/deepseek.go` 双开 `SupportsOutputConfig=true` + `SupportsResponseFormat=true`
+- `presets/{deepseek_openai,openai_compat,openai_compat_custom,dashscope_openai,zhipu_openai,volcengine_openai}.go` 显式 `SupportsResponseFormat=true` (OpenAI-wire 原生)
+- `model.AnthropicProxyRequest` 新增 `ResponseFormat` 字段 + `ToChatProxyRequest` 复制
+- `service/model_gateway.go` 新增 `adaptAnthropicDeepSeek` 专属适配器, dispatch 仅对 DeepSeek + AnthropicFormat 启用; 其他 Anthropic-wire provider 保持 `adaptAnthropic` 纯净路径
+
+**对 SDK 调用方可见面**:
+- `/api/v4/managed-models/<deepseek-id>/anthropic` 端点开始接受 `response_format: {type:"json_object"}` 请求体, 上游 DeepSeek 返回 JSON
+- 同字段发到 Anthropic-official / DashScope-anthropic / Zhipu-anthropic / OpenRouter / third-party 仍被网关 sanitizer 自动剥除 (双层防御), 不会 400
+- SDK 高级 API (`Thinking.Level` / `OutputConfig{Format,Schema}`) 在 DeepSeek-anthropic 上**未自动适配**, 见 `§4.3 DeepSeek-anthropic 接入` compat 模式
+- 计划 v0.14 引入 SDK provider-aware adapter 自动翻译, 届时高级 API 在 DeepSeek 上即可正确生效
+
+### v0.14.x 服务端 (2026-04-27) — 长远项 L1 / L3 / L7 落地
+
+> 网关与服务端基建升级, 对 SDK 用户**0 破坏性变更**. SDK 自身代码 0 改动 (HEAD `v0.14.1`, `0931b49`). 本节列出三项基建对 SDK 调用方的可见契约面, 帮助调用方应用网关侧能力.
+>
+> 范围澄清: 本批仅落 **L1 / L3 / L7** 三项 (其中 L3 含 PR1 runstatus 包 + PR2 5 model 字段类型化). L2 alert / L4 OTel / L5 多凭证 failover / **L6 SDK 内置 retry policy** 均**未实施**, 后续版本独立推进.
+
+#### L1 — 网关错误码细化 (后端 `pkg/errkind` + `pkg/transport.Do`)
+
+后端新增 `pkg/errkind/` (15 Kind 物理出 `service/gateway/errors`, 27 case 透明) + `pkg/transport.Do` (含 `SingleRetry` 200ms 单次退避, `DefaultRetryBackoff` 常量). **62 处** outbound HTTP 全部迁 `transport.Do` (实测 grep 命中, 含 handler/adk/auth/plugin/workflow/storage/chat/multimodal/code_interpreter/skill/notification/mcp/client/service 全子树).
+
+**对 SDK 调用方可见面** (在 v0.14.1 已发布, 此处汇总):
+- `*StreamError.Code` / `errors.As` 可获 5 个新 transport kind, 与 v0.14.1 错误码表一致:
+  - `upstream_timeout` / `upstream_unreachable` / `upstream_disconnect` / `upstream_malformed` / `client_canceled`
+- 网关侧透明 200ms 单次重试吃 80%+ 瞬断 — SDK 调用方无需自行重试 GET 类查询 (但**计费类 POST 仍不重试**, 见 v0.14.1 段)
+- 错误文本 (`*StreamError.Error()`) 严格保留, Tauri/Rust 字符串匹配兼容
+
+**SDK 端不变**: 三处 Do (`chatStreamInternal` L761 / `doJSONFullInternal` L1638 / `doPublicJSON` L1737) 仍是 401 单次 refresh 模式, **未引入 RetryPolicy / SafeToRetry / 指数退避** — 该项 (L6) 后续 v0.15 独立推进.
+
+#### L3 — 状态字段字面量契约 (后端 `pkg/runstatus` 6 域)
+
+后端新增 `pkg/runstatus/` (6 域命名 string 类型 + `CanTransition` 状态机) + L3.PR2 5 个 model 字段从 `string` 升级为 `runstatus.Status`: `WorkflowRun.Status` / `WorkflowRunStep.Status` / `ConsumeRecord.Status` / `PluginExecutionLog.Status` / `ManagedModelUsageLog.Status` (后者 L3.PR2 之前已迁).
+
+**对 SDK 调用方可见面**: **0 行为变化**. `runstatus.Status` 是 `string` 底层命名类型, JSON marshal/unmarshal / DB 字面量 / SSE 协议字段全部不变. 服务端 GORM 自动 scan/value, 跨 Java 边界透传 `json.RawMessage` 不解析 Status.
+
+**状态字段字面量契约表** (跨版本稳定保证):
+
+| 域 | 端点 | 字段 | 字面量集 |
+|---|---|---|---|
+| Workflow | `GET /api/v4/workflow/runs/:id` | `status` | `pending` / `running` / `completed` / `failed` / `cancelled` |
+| WorkflowStep | 同上 (steps[]) | `status` | `pending` / `running` / `completed` / `failed` / `skipped` |
+| ConsumeRecord | SSE `managed-model.v2` event | `consumeStatus` | `HELD` / `PENDING_SETTLE` / `SETTLED` / `RELEASED` |
+| PluginExec | `GET /api/v4/admin/logs?type=plugin` | `status` | `SUCCESS` / `FAILED` (DB 原值) → 看板映射 `success` / `error` |
+| Gateway | `GET /api/v4/admin/logs?type=managed-model` | `status` | `success` / `error` / `timeout` / `pending_settle` / `empty_response` / `upstream_timeout` / `upstream_unreachable` / `upstream_disconnect` / `upstream_malformed` / `client_canceled` |
+| AppExec | `GET /api/v4/admin/logs?type=app` | `status` | `pending` / `running` / `waiting` / `completed` / `failed` / `cancelled` |
+
+**注意大小写**: ConsumeRecord 与 PluginExec 是大写 (跨 Java 兼容 / 插件审核体系沿用), 其余是小写. SDK 解析时严格按字面量比较, **不要做 case-insensitive 转换**.
+
+**附加修复**: `handler/plugin_health.go` 4 处 `fmt.Errorf("...: %v", err)` → `%w` (errors.As 链可见性恢复). 错误文本完全一致, 字符串匹配兼容. SDK 端无变化.
+
+#### L7 — 服务端测试基建 (后端 `pkg/testutil/flaky`)
+
+后端新增 `pkg/testutil/flaky/` 5 个 httptest 夹具 (`ServeAndCloseAfterBytes` / `ServeAndDelay` / `ServeChunked` / `ServeMalformed` / `ServeUnreachable`) + 10 单测, 给 V2 P0 / L1 / 后续 L5/L6 测试复用.
+
+**对 SDK 调用方可见面**: **完全透明**. 这是服务端测试基建, 不影响 API/protocol/error 契约.
 
 ### v0.14.1 (2026-04-26) — 错误码细化 V2 P0
 

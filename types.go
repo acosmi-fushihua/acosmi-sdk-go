@@ -903,6 +903,69 @@ type businessCodeChecker interface {
 	businessError() error
 }
 
+// ---------------------------------------------------------------------------
+// L6 V2 P1 (2026-04-27, v0.15): 结构化 HTTP / 网络错误类型
+//
+// 老实现 parseHTTPError 返回 fmt.Errorf 字符串错误, 调用方无法 errors.As 出来分类.
+// 网络错误 (timeout/EOF/connection refused) 直接 *net.OpError 透传, 无统一封装.
+// L6 retry policy 必须基于结构化错误判断可重试 → 必须先做类型化 (V2 P1 前置).
+//
+// 文案兼容承诺: HTTPError.Error() 保留 "HTTP %d: %s" / "HTTP %d: [%s] %s" 格式;
+// NetworkError.Error() 包含原始 op + url + cause.Error() — 老调用方字符串匹配 0 破坏.
+// ---------------------------------------------------------------------------
+
+// HTTPError 结构化 HTTP 非 2xx 错误.
+//
+// 用 errors.As 提取:
+//
+//	var he *acosmi.HTTPError
+//	if errors.As(err, &he) {
+//	    if he.StatusCode == 429 { ... } // 与 RateLimitError 不同, RateLimitError 仅下载链路用
+//	}
+type HTTPError struct {
+	StatusCode int    // HTTP 状态码
+	Type       string // anthropic.error.type / openai.error.type, 缺失为空
+	Message    string // 错误消息
+	RetryAfter int    // Retry-After 头解析的秒数, 0 表示未提供或解析失败
+	Body       string // 原始响应体 (截断到 maxErrorBodySize)
+}
+
+func (e *HTTPError) Error() string {
+	if e.Type != "" {
+		return fmt.Sprintf("HTTP %d: [%s] %s", e.StatusCode, e.Type, e.Message)
+	}
+	if e.Message != "" {
+		return fmt.Sprintf("HTTP %d: %s", e.StatusCode, e.Message)
+	}
+	if e.Body != "" {
+		return fmt.Sprintf("HTTP %d: %s", e.StatusCode, e.Body)
+	}
+	return fmt.Sprintf("HTTP %d", e.StatusCode)
+}
+
+// NetworkError 结构化网络层错误 (传输失败, 区别于上游业务错误).
+//
+// 包装 c.http.Do 返回的 err — 含 timeout / EOF / connection refused / DNS 失败等.
+// L6 retry policy: IsTimeout()/IsEOF() 任一为 true → 默认可重试 (与 SafeToRetry 配合).
+type NetworkError struct {
+	Op      string // 操作描述, e.g. "POST /v1/messages"
+	URL     string // 请求 URL (脱敏后)
+	Cause   error  // 原始 net 错误
+	Timeout bool   // ctx.DeadlineExceeded / net.OpError.Timeout()
+	EOF     bool   // io.EOF / "unexpected EOF" / "connection reset"
+}
+
+func (e *NetworkError) Error() string {
+	if e.Cause != nil {
+		return fmt.Sprintf("%s %s: %s", e.Op, e.URL, e.Cause.Error())
+	}
+	return fmt.Sprintf("%s %s: network error", e.Op, e.URL)
+}
+
+func (e *NetworkError) Unwrap() error { return e.Cause }
+func (e *NetworkError) IsTimeout() bool { return e.Timeout }
+func (e *NetworkError) IsEOF() bool     { return e.EOF }
+
 // ---------- API Response Wrapper ----------
 
 // APIResponse nexus-v4 标准响应
