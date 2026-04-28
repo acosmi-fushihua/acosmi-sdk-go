@@ -571,6 +571,17 @@ eventCh, errCh := client.ChatStream(ctx, modelID, acosmi.ChatRequest{
 })
 ```
 
+**网关侧 fallback (2026-04-28)**: 即使下游 provider 不支持原生 server tool (DeepSeek / Zhipu / DashScope / VolcEngine 的 Anthropic-format 路径, `caps.SupportsWebSearch=false`), SDK 仍可正常发送 `ServerTools: [WebSearchTool]`。网关自动:
+
+1. 检测请求 body 中的 server tool, 改写为 client function tool 让上游模型以 function-calling 形式触发
+2. 模型 emit `tool_use(name="web_search")` 后, 网关同步调本地配置的搜索插件 (阿里云 dashscope-web-search 优先 / 博查 bocha-web-search 兜底; 智普暂未启用)
+3. 用 `tool_result` 续轮上游, 拿到模型基于真实搜索结果整合后的最终答案
+4. 合并两轮 SSE 流给 SDK: 单条 message 内含 `text + tool_use + final_text`, content_block index 单调递增
+
+**前置条件**: 管理员在 admin 控制台创建该托管模型时勾选阿里云 / 博查搜索插件 (写入 `managed_model.DefaultToolIDs`)。未勾选则 fallback 报错 `no usable plugin (dashscope/bocha) in DefaultToolIDs`, SDK 收到 `event:error`。
+
+**计费**: 双轮上游均计费 (input/output token 求和后通过单次 RecordUsage 写入); 搜索插件按其 `PricingType` 单独计费。
+
 #### Beta Header 自动组装
 
 每次 Chat 调用自动注入适用的 Beta Header，无需手动管理:
