@@ -45,6 +45,11 @@ func TestApplyRequestSanitizers_HistoryDepth_RawMessagesBranch(t *testing.T) {
 }
 
 // ---------- AutoStripEphemeral 从 RawMessages 中剥离标记 block ----------
+//
+// v0.15.2 起 thinking / redacted_thinking 在 sanitize.StripEphemeral 内置硬豁免,
+// 即使带 ephemeral 标记也保留 (Anthropic extended thinking + tool_use 续轮要求)。
+// 本测试用 server_tool_use 验证 ephemeral 剥除主路径仍可工作, 同时确认 thinking
+// 不会被剥。
 
 func TestApplyRequestSanitizers_AutoStripEphemeral(t *testing.T) {
 	c := &Client{}
@@ -55,7 +60,10 @@ func TestApplyRequestSanitizers_AutoStripEphemeral(t *testing.T) {
 			map[string]any{
 				"role": "assistant",
 				"content": []any{
+					// thinking 带 ephemeral → 硬豁免, 必须保留
 					map[string]any{"type": "thinking", "thinking": "x", "acosmi_ephemeral": true},
+					// server_tool_use 带 ephemeral → 应被剥
+					map[string]any{"type": "server_tool_use", "id": "stu_1", "name": "web_search", "acosmi_ephemeral": true},
 					map[string]any{"type": "text", "text": "visible"},
 				},
 			},
@@ -69,11 +77,14 @@ func TestApplyRequestSanitizers_AutoStripEphemeral(t *testing.T) {
 		t.Fatalf("expected 1 message, got %d", len(msgs))
 	}
 	content := msgs[0].(map[string]any)["content"].([]any)
-	if len(content) != 1 {
-		t.Fatalf("expected 1 block (text), got %d: %+v", len(content), content)
+	if len(content) != 2 {
+		t.Fatalf("expected 2 blocks (thinking 豁免 + 普通 text), got %d: %+v", len(content), content)
 	}
-	if content[0].(map[string]any)["type"] != "text" {
-		t.Errorf("remaining block should be text")
+	if content[0].(map[string]any)["type"] != "thinking" {
+		t.Errorf("thinking must be preserved, got %v", content[0])
+	}
+	if content[1].(map[string]any)["type"] != "text" {
+		t.Errorf("non-ephemeral text must remain, got %v", content[1])
 	}
 }
 

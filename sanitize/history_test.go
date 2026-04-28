@@ -22,14 +22,22 @@ func thinkingBlock(text string, eph bool) map[string]any {
 	return b
 }
 
-// ---------- 基础: 剥 thinking ----------
+// ---------- 基础: thinking 永不剥 (硬豁免) ----------
+//
+// 历史背景: 早期 v0.13~v0.15.1 期间, 网关 Anthropic preset 给 thinking 块注入
+// acosmi_ephemeral=true, 客户端 StripEphemeral 据此剥除。这导致 extended thinking
+// + tool_use 续轮场景下, 上游强制要求保留 thinking 但客户端已剥 → 400:
+//   "The content[].thinking in the thinking mode must be passed back to the API."
+// v0.15.2 起 thinking / redacted_thinking 内置硬豁免, 即使带 ephemeral 标记
+// 也不剥 (网关 commit 55fe8090 已停止注入, 此豁免兜底历史污染会话)。
 
-func TestStripEphemeral_RemovesMarkedThinking(t *testing.T) {
+func TestStripEphemeral_NeverStripsThinking(t *testing.T) {
 	msgs := []any{
 		map[string]any{
 			"role": "assistant",
 			"content": []any{
-				thinkingBlock("internal reasoning", true),
+				thinkingBlock("internal reasoning", true), // 带 ephemeral 标记
+				ephemeralTextBlock("ephemeral note", true), // 也带标记 (作为对照)
 				map[string]any{"type": "text", "text": "hello"},
 			},
 		},
@@ -39,11 +47,79 @@ func TestStripEphemeral_RemovesMarkedThinking(t *testing.T) {
 		t.Fatalf("expected 1 message, got %d", len(out))
 	}
 	content := out[0].(map[string]any)["content"].([]any)
-	if len(content) != 1 {
-		t.Fatalf("expected 1 block after strip, got %d", len(content))
+	if len(content) != 2 {
+		t.Fatalf("expected 2 blocks (thinking 豁免 + 普通 text), got %d: %+v", len(content), content)
 	}
-	if content[0].(map[string]any)["type"] != "text" {
-		t.Errorf("remaining block should be text, got %v", content[0])
+	// 第一块应是 thinking, 第二块是 hello (ephemeral text 被剥)
+	if content[0].(map[string]any)["type"] != "thinking" {
+		t.Errorf("thinking must be preserved, got %v", content[0])
+	}
+	if content[1].(map[string]any)["text"] != "hello" {
+		t.Errorf("non-ephemeral text must remain, got %v", content[1])
+	}
+}
+
+func TestStripEphemeral_NeverStripsRedactedThinking(t *testing.T) {
+	msgs := []any{
+		map[string]any{
+			"role": "assistant",
+			"content": []any{
+				map[string]any{
+					"type":               "redacted_thinking",
+					"data":               "encrypted-blob",
+					EphemeralMarkerField: true,
+				},
+				map[string]any{"type": "text", "text": "answer"},
+			},
+		},
+	}
+	out := StripEphemeral(msgs)
+	content := out[0].(map[string]any)["content"].([]any)
+	if len(content) != 2 {
+		t.Fatalf("redacted_thinking must survive ephemeral marker, got %d blocks", len(content))
+	}
+	if content[0].(map[string]any)["type"] != "redacted_thinking" {
+		t.Errorf("first block must be redacted_thinking, got %v", content[0])
+	}
+}
+
+// thinking 是 tool_use 类 block 之外的类型, 不应触发 droppedToolUseIDs 收集,
+// 即不能联动剥 user 轮的 tool_result。
+func TestStripEphemeral_ThinkingDoesNotCascade(t *testing.T) {
+	msgs := []any{
+		map[string]any{
+			"role": "assistant",
+			"content": []any{
+				thinkingBlock("plan...", true),
+				map[string]any{
+					"type": "tool_use",
+					"id":   "tu_1",
+					"name": "calc",
+				},
+			},
+		},
+		map[string]any{
+			"role": "user",
+			"content": []any{
+				map[string]any{
+					"type":        "tool_result",
+					"tool_use_id": "tu_1",
+					"content":     "42",
+				},
+			},
+		},
+	}
+	out := StripEphemeral(msgs)
+	if len(out) != 2 {
+		t.Fatalf("both turns must survive (thinking 豁免, tool_use 无 ephemeral), got %d", len(out))
+	}
+	a := out[0].(map[string]any)["content"].([]any)
+	if len(a) != 2 {
+		t.Errorf("assistant turn must keep thinking + tool_use, got %d", len(a))
+	}
+	u := out[1].(map[string]any)["content"].([]any)
+	if len(u) != 1 {
+		t.Errorf("user tool_result must NOT be cascade-dropped, got %d", len(u))
 	}
 }
 
