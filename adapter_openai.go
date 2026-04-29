@@ -199,8 +199,10 @@ func convertOpenAIToChatResponse(oai *OpenAIChatResponse) (*ChatResponse, error)
 			InputTokens:  oai.Usage.PromptTokens,
 			OutputTokens: oai.Usage.CompletionTokens,
 		},
-		TokenRemaining: -1,
-		CallRemaining:  -1,
+		TokenRemaining:         -1,
+		CallRemaining:          -1,
+		ModelTokenRemaining:    -1,
+		ModelTokenRemainingETU: -1,
 	}
 
 	if len(oai.Choices) > 0 {

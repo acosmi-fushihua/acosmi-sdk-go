@@ -56,7 +56,14 @@ type Client struct {
 
 	// L6 (v0.15): 重试策略. nil = 禁用 (v0.14.1 行为).
 	retryPolicy *RetryPolicy
+
+	// V29 系数缓存 (TTL 8s, ListCoefficients 内部用)
+	coefCacheMu   sync.Mutex
+	coefCacheData []ModelCoefficient
+	coefCacheAt   time.Time
 }
+
+const coefCacheTTL = 8 * time.Second
 
 // Config 客户端配置
 type Config struct {
@@ -561,6 +568,17 @@ func (c *Client) Chat(ctx context.Context, modelID string, req ChatRequest) (*Ch
 	if v := headers.Get("X-Call-Remaining"); v != "" {
 		if n, parseErr := strconv.Atoi(v); parseErr == nil {
 			resp.CallRemaining = n
+		}
+	}
+	// V29: 当前模型剩余 token (raw + ETU)
+	if v := headers.Get("X-Token-Remaining-Model"); v != "" {
+		if n, parseErr := strconv.ParseInt(v, 10, 64); parseErr == nil {
+			resp.ModelTokenRemaining = n
+		}
+	}
+	if v := headers.Get("X-Token-Remaining-Model-ETU"); v != "" {
+		if n, parseErr := strconv.ParseInt(v, 10, 64); parseErr == nil {
+			resp.ModelTokenRemainingETU = n
 		}
 	}
 	return resp, nil
@@ -1150,6 +1168,63 @@ func (c *Client) ClaimMonthlyFree(ctx context.Context) (*EntitlementItem, error)
 		return nil, err
 	}
 	return &resp.Data, nil
+}
+
+// ----------------------------------------------------------------------------
+// V29 Per-Model Bucket APIs
+// ----------------------------------------------------------------------------
+
+// GetByModel 查询当前用户在指定模型下的剩余 token (raw + ETU)。
+// 应用层切换模型时调用; HasQuota=false 时建议给用户提示并阻止该模型请求。
+func (c *Client) GetByModel(ctx context.Context, modelID string) (*ModelByQuotaResponse, error) {
+	if modelID == "" {
+		return nil, fmt.Errorf("modelID required")
+	}
+	path := "/entitlements/by-model?modelId=" + url.QueryEscape(modelID)
+	var resp APIResponse[ModelByQuotaResponse]
+	if err := c.doJSON(ctx, http.MethodGet, path, nil, &resp, false); err != nil {
+		return nil, err
+	}
+	return &resp.Data, nil
+}
+
+// ListBuckets 列出当前用户的全部桶 (个人中心多桶 hero 数据源)。
+func (c *Client) ListBuckets(ctx context.Context) ([]ModelBucket, error) {
+	var resp APIResponse[[]ModelBucket]
+	if err := c.doJSON(ctx, http.MethodGet, "/entitlements/buckets", nil, &resp, false); err != nil {
+		return nil, err
+	}
+	return resp.Data, nil
+}
+
+// ListCoefficients 拉取模型系数表; 客户端可本地按 modelID 索引并按 OutputCoef 反向估算 raw token。
+// SDK 自带 8s TTL 内存缓存以减小调用风暴。
+func (c *Client) ListCoefficients(ctx context.Context) ([]ModelCoefficient, error) {
+	c.coefCacheMu.Lock()
+	if c.coefCacheData != nil && time.Since(c.coefCacheAt) < coefCacheTTL {
+		out := append([]ModelCoefficient(nil), c.coefCacheData...)
+		c.coefCacheMu.Unlock()
+		return out, nil
+	}
+	c.coefCacheMu.Unlock()
+
+	var resp APIResponse[[]ModelCoefficient]
+	if err := c.doJSON(ctx, http.MethodGet, "/entitlements/coefficients", nil, &resp, false); err != nil {
+		return nil, err
+	}
+	c.coefCacheMu.Lock()
+	c.coefCacheData = append([]ModelCoefficient(nil), resp.Data...)
+	c.coefCacheAt = time.Now()
+	c.coefCacheMu.Unlock()
+	return resp.Data, nil
+}
+
+// InvalidateCoefficientCache 手动失效系数缓存 (admin 调价后建议立即调一次)。
+func (c *Client) InvalidateCoefficientCache() {
+	c.coefCacheMu.Lock()
+	c.coefCacheData = nil
+	c.coefCacheAt = time.Time{}
+	c.coefCacheMu.Unlock()
 }
 
 // ============================================================================

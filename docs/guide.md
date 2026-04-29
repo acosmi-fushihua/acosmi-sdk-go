@@ -1,6 +1,6 @@
 # Acosmi Go SDK 开发手册
 
-> v0.15.2 | Go 1.22+ | MIT
+> v0.16.0 | Go 1.22+ | MIT
 
 ## 目录
 
@@ -632,7 +632,7 @@ req.Thinking = &acosmi.ThinkingConfig{Type: "adaptive", Level: acosmi.ThinkingHi
 ```go
 // 配合模型能力开关 UI
 caps, _ := client.GetModelCapabilities(ctx, modelID)
-if caps.SupportsDeepThinking {
+if caps.SupportsMaxEffort {
     req.Thinking = acosmi.NewThinkingConfig(acosmi.ThinkingMax)
 }
 ```
@@ -850,6 +850,82 @@ if err != nil {
 > **关于 `MONTHLY_QUOTA` / `REGISTRATION_BONUS` / `INVITE_REWARD` 类型**:
 > 这些 entitlement 的 `allowed_models` 设计上为空 (按 type 维度授权, 不限模型),
 > 同步只覆盖 `TOKEN_PACKAGE` 类型 (套餐购买快照需追平)。
+
+#### V29: Per-Model 桶计费 (v0.16.0+)
+
+**背景**: 传统单池扣减不区分模型,Opus 与 DeepSeek 单价相差 200x 导致"白嫖额度刷高价模型"赔本。
+V29 把套餐拆成**按模型的独立桶**,每个桶用 ETU (Equivalent Token Unit) 折算计量。
+
+**核心概念**:
+- **ETU**: 桶内部记账单位,= raw_token × coef (input/output/cache_read 三系数加权)
+- **COMMERCIAL 桶**: 套餐购买的精确 modelId 桶,真金白银
+- **GENERIC 桶**: 注册赠送/邀请奖励/月度免费的通配桶 (model_id='*'),仅允许便宜模型白名单
+- **桶选择优先级**: COMMERCIAL > GENERIC,同 class 内精确匹配 > 通配兜底
+
+```go
+// 1. 查指定模型剩余 (raw + ETU). 切换模型时建议预查, HasQuota=false 则拦截
+m, err := client.GetByModel(ctx, "deepseek-v3")
+if err != nil {
+    return err
+}
+if !m.HasQuota {
+    fmt.Println("该模型已无额度, 请购买套餐或换模型")
+    return nil
+}
+fmt.Printf("DeepSeek 剩余: %d raw token (%d ETU)\n",
+    m.RawTokenRemaining, m.ETURemaining)
+if m.PrimaryBucket != nil {
+    fmt.Printf("  来源桶: %s class=%s\n",
+        m.PrimaryBucket.BucketID, m.PrimaryBucket.BucketClass)
+}
+
+// 2. 列出全部桶 (个人中心多桶 hero 数据源)
+buckets, _ := client.ListBuckets(ctx)
+for _, b := range buckets {
+    label := b.ModelID
+    if b.ModelID == "*" {
+        label = "GENERIC (允许: " + b.AllowedModelsJSON + ")"
+    }
+    fmt.Printf("  [%s] %s: %d/%d ETU\n", b.BucketClass, label, b.TokenUsed, b.TokenQuota)
+}
+
+// 3. 拉系数表 (UI 反向估算 raw token 用); SDK 内置 8s TTL 缓存避免风暴
+coefs, _ := client.ListCoefficients(ctx)
+for _, c := range coefs {
+    fmt.Printf("  %s: in=%.4f out=%.4f cacheR=%.4f v%d\n",
+        c.ModelID, c.InputCoef, c.OutputCoef, c.CacheReadCoef, c.Version)
+}
+// admin 改系数后立即失效缓存
+client.InvalidateCoefficientCache()
+```
+
+**Chat 响应自动回填模型剩余** (Header `X-Token-Remaining-Model` / `X-Token-Remaining-Model-ETU`):
+
+```go
+resp, _ := client.Chat(ctx, "deepseek-v3", req)
+// adapter 初始化为 -1 = 服务端未返回该头 (灰度期或单池模式); ≥ 0 = 真实剩余
+if resp.ModelTokenRemaining >= 0 {
+    fmt.Printf("当前模型剩余: %d raw token (%d ETU)\n",
+        resp.ModelTokenRemaining, resp.ModelTokenRemainingETU)
+}
+```
+
+**典型集成场景**:
+
+| 用例 | 推荐 API | 缓存 |
+|------|----------|------|
+| 模型选择器显示余量 badge | `GetByModel` | **无 SDK 缓存**, 调用方自行节流 (建议 ≥ 5s/模型) |
+| 个人中心多桶展示 | `ListBuckets` | **无 SDK 缓存**, 应用层每次刷新主动调 |
+| Chat 响应后实时刷新当前模型 | `resp.ModelTokenRemaining` (响应头自动填充) | 0 额外 RTT |
+| Pricing 页显示 ETU 系数表 | `ListCoefficients` | **8s TTL 内置缓存** (`InvalidateCoefficientCache()` 手动失效) |
+
+> **缓存边界提醒**: 仅 `ListCoefficients` 在 SDK 层带 8s TTL (实证: `client.go` `coefCacheTTL = 8 * time.Second`)。
+> 其余三个 API 每次都走 HTTP, 调用方需自行控制频率 — 否则 chat 高频场景会拖慢 RTT。
+
+**注意事项**:
+- ETU 与 raw token 不是 1:1: 用 `OutputCoef` 反向除可估算 raw 等值,但精确量在 hold/settle 时才确定
+- GENERIC 桶模型受 `AllowedModelsJSON` 白名单限制,调白名单外的模型会 403 `MODEL_NOT_ALLOWED`
+- 灰度期老用户 entitlement 可能无桶 (`ListBuckets` 返回空), 此时仍走 legacy 单池路径,不影响 Chat 调用
 
 ### 4.5 流量包商城
 
@@ -1102,9 +1178,10 @@ type ModelCapabilities struct {
     SupportsThinking, SupportsAdaptiveThinking, SupportsISP       bool
     // 工具与搜索
     SupportsWebSearch, SupportsToolSearch, SupportsStructuredOutput bool
-    // 推理控制
+    // 推理控制 (SupportsMaxEffort: 模型支持 thinking_level=max 强度档,
+    //          适用于 Opus 4.6 / DeepSeek-V4 等; 详见 §思考级别 段)
     SupportsEffort, SupportsMaxEffort, SupportsFastMode            bool
-    SupportsAutoMode, SupportsDeepThinking                         bool // v0.9.0: 深度思考 (Opus 4.6)
+    SupportsAutoMode                                               bool
     // 上下文与缓存
     Supports1MContext, SupportsPromptCache, SupportsCacheEditing   bool
     // 输出控制
@@ -1156,6 +1233,10 @@ type ChatResponse struct {
     Usage      ChatUsage          // 输入/输出 token + prompt cache 用量
     TokenRemaining int64 // Header X-Token-Remaining 填充，-1=未返回
     CallRemaining  int   // Header X-Call-Remaining 填充，-1=未返回
+    // V29 (v0.16.0+): 当前模型剩余 token, 从响应头 X-Token-Remaining-Model[-ETU] 填充
+    // 默认初始化为 -1 (与 TokenRemaining 一致); ≥0 = 真实值
+    ModelTokenRemaining    int64 // raw token 估算 (UI 展示)
+    ModelTokenRemainingETU int64 // 折算后 ETU (调度判定)
 }
 
 type ChatContentBlock struct {
@@ -1317,6 +1398,37 @@ type ConsumeRecord struct {
     TokensConsumed int64; Status, CreatedAt string
 }
 type ConsumeRecordPage struct { Records []ConsumeRecord; Total int64; Page, PageSize int }
+```
+
+### V29 Per-Model 桶 (v0.16.0+)
+
+```go
+// 单桶视图 — TokenQuota/TokenUsed 单位均是 ETU (折算后), 不是原始 token
+type ModelBucket struct {
+    BucketID, EntitlementID string
+    ModelID                 string  // "*" = 通配 (GENERIC)
+    BucketClass             string  // COMMERCIAL | GENERIC
+    TokenQuota, TokenUsed, TokenRemaining int64
+    CallQuota, CallUsed, CallRemaining    int
+    CoefficientVersion                    int
+    AllowedModelsJSON                     string // 仅 GENERIC, JSON 数组
+}
+
+// GetByModel 响应; PrimaryBucket nil 表示该模型无任何可用桶
+type ModelByQuotaResponse struct {
+    ModelID                          string
+    ETURemaining, RawTokenRemaining  int64
+    HasQuota                         bool
+    PrimaryBucket                    *ModelBucket
+}
+
+// 单条系数 (SDK 8s TTL 缓存)
+type ModelCoefficient struct {
+    ModelID, TenantID                                 string
+    InputCoef, OutputCoef, CacheReadCoef, CacheCreationCoef float64
+    Version                                            int
+    EffectiveAt                                        string
+}
 ```
 
 ### 商城 / 钱包
@@ -1755,6 +1867,42 @@ make install    # → $GOPATH/bin
 ---
 
 ## 12. 版本记录
+
+### v0.16.0 (2026-04-28)
+
+- **V29 Per-Model 桶计费支持**: 新增 `GetByModel(ctx, modelID)` / `ListBuckets(ctx)` /
+  `ListCoefficients(ctx)` / `InvalidateCoefficientCache()` 四个 API。
+- 新类型: `ModelBucket` / `ModelByQuotaResponse` / `ModelCoefficient`。
+- `ChatResponse` 新增 `ModelTokenRemaining` / `ModelTokenRemainingETU` 两字段,
+  从响应头 `X-Token-Remaining-Model[-ETU]` 自动填充, **adapter 初始化为 -1 = 未返回**
+  (与原有 `TokenRemaining` 哨兵语义一致, 调用方用 `>= 0` 判定有效值)。
+- 缓存边界: **仅 `ListCoefficients` 自带 8s TTL** (`coefCacheTTL` 常量), 其余
+  `GetByModel` / `ListBuckets` 每次走 HTTP, 调用方需自行节流。`InvalidateCoefficientCache()`
+  手动失效系数缓存 (admin 调价后)。
+- 计量单位 **ETU** (Equivalent Token Unit) 替代单池 raw token: 桶按
+  `input_coef × in + output_coef × out + cache_read_coef × cacheRead` 折算扣减。
+- GENERIC 通配桶 (注册/邀请/月度) 受 `AllowedModelsJSON` 白名单限制, 防白嫖刷高价模型。
+- 灰度兼容: 老 entitlement 无桶时 `ListBuckets` 返回空, Chat 仍走 legacy 单池, 不破。
+- 相关说明见 §4.4 "V29: Per-Model 桶计费" 与 §6 "V29 Per-Model 桶"。
+- ⚠️ **Breaking — `ModelCapabilities.SupportsDeepThinking` 字段移除**
+  - **背景**: v0.9.0 引入此字段, 但全 SDK 0 处行为消费 (仅 docs 示例引用),
+    backend `ModelCapabilities` 也从未声明该字段, 实际是单边死字段。
+  - **迁移**: 全部改用 `SupportsMaxEffort`。两者语义等价 ("是否支持 thinking_level=max
+    强度档"), `SupportsMaxEffort` 是 SDK 唯一行为字段 (`adapter_anthropic.go:182`)。
+  - **判断逻辑示例**:
+    ```go
+    // 旧 (v0.15.x 及之前)
+    if caps.SupportsDeepThinking { ... }
+    // 新 (v0.16.0+)
+    if caps.SupportsMaxEffort { ... }
+    ```
+- ⚠️ **语义修正 — `SupportsMaxEffort` 注释**
+  - 旧注释 "Opus 4.6 独有" 误导, 实际字段语义是"模型支持 thinking_level=max
+    请求"; DeepSeek-V4-Pro/Flash (官方 anthropic 兼容端点) 经 gateway
+    `EffortHandling=ToOutputConfig` 翻译后完全可用。注释更新为中性描述。
+  - 行为零变化, 老代码无须改动 (字段值由后端 `/managed-models` 端点驱动)。
+
+### v0.15.x
 
 > 本节只保留 SDK 使用者最需要关心的兼容点与破坏性变更。更细的网关实现背景、审计过程和分阶段交付记录，建议查主仓架构文档。
 

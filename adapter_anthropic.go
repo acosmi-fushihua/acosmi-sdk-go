@@ -212,6 +212,8 @@ func (a *AnthropicAdapter) ParseResponse(body []byte) (*ChatResponse, error) {
 	}
 	resp.TokenRemaining = -1
 	resp.CallRemaining = -1
+	resp.ModelTokenRemaining = -1
+	resp.ModelTokenRemainingETU = -1
 	return &resp, nil
 }
 

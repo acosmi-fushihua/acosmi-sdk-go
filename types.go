@@ -89,11 +89,19 @@ type ModelCapabilities struct {
 	SupportsStructuredOutput bool `json:"supports_structured_output"`
 
 	// 推理控制
-	SupportsEffort       bool `json:"supports_effort"`
-	SupportsMaxEffort    bool `json:"supports_max_effort"`    // Opus 4.6 独有
-	SupportsFastMode     bool `json:"supports_fast_mode"`     // Opus 4.6 独有
-	SupportsAutoMode     bool `json:"supports_auto_mode"`     // Auto 模式 (模型自主选择工具/搜索策略)
-	SupportsDeepThinking bool `json:"supports_deep_thinking"` // 支持 max 深度思考 (Opus 4.6)
+	SupportsEffort bool `json:"supports_effort"`
+	// SupportsMaxEffort 模型是否支持 thinking_level="max" 强度档 (深度思考)。
+	// 与模型家族无关, 仅取决于上游路径是否接受 effort=max 请求:
+	//   - Anthropic Opus 4.6: 原生支持, 顶层 effort.level=max
+	//   - DeepSeek-V4-Pro/Flash (官方 anthropic 兼容端点): 支持, gateway 经
+	//     EffortHandling=ToOutputConfig 翻译为 output_config.effort=max
+	//   - 上游不接受或仍未实测: false (即便置 true, adapter_anthropic.go:182
+	//     仍会降到 effort=high, 不会引发 400)
+	// SDK 单点消费: adapter_anthropic.go ChatRequest 序列化时控制是否发 effort.level=max。
+	SupportsMaxEffort bool `json:"supports_max_effort"`
+	SupportsFastMode  bool `json:"supports_fast_mode"` // Opus 4.6 独有 (Speed="fast")
+	SupportsAutoMode  bool `json:"supports_auto_mode"` // Auto 模式 (模型自主选择工具/搜索策略)
+	// (v0.16.0 移除 SupportsDeepThinking 死字段, 改用 SupportsMaxEffort; 见 § 12 版本记录)
 
 	// 上下文与缓存
 	Supports1MContext    bool `json:"supports_1m_context"`
@@ -248,7 +256,10 @@ type GeoLoc struct {
 
 // EffortConfig 控制推理努力级别
 type EffortConfig struct {
-	Level string `json:"level"` // "low" | "medium" | "high" | "max" (max=Opus 4.6 only)
+	// Level 取值 "low" | "medium" | "high" | "max"。
+	// "max" 是否被采用取决于 caps.SupportsMaxEffort: 不支持的模型 SDK 自动降到 "high"
+	// (adapter_anthropic.go:182), 不会引发上游 400。
+	Level string `json:"level"`
 }
 
 // OutputConfig 控制输出格式 (结构化输出)
@@ -417,6 +428,10 @@ type ChatResponse struct {
 	// -1 表示服务端未返回
 	TokenRemaining int64 `json:"-"`
 	CallRemaining  int   `json:"-"`
+	// V29 (v0.16.0+): 当前模型剩余 (从响应头 X-Token-Remaining-Model[-ETU] 填充)
+	// adapter 初始化为 -1 = 未返回 (与 TokenRemaining 哨兵语义一致); ≥ 0 表示真实值
+	ModelTokenRemaining    int64 `json:"-"`
+	ModelTokenRemainingETU int64 `json:"-"`
 }
 
 // AnthropicResponse Anthropic 原生格式同步响应
@@ -604,6 +619,53 @@ type ConsumeRecord struct {
 	TokensConsumed  int64  `json:"tokensConsumed"`
 	Status          string `json:"status"`
 	CreatedAt       string `json:"createdAt"`
+}
+
+// ---------- V29 Per-Model Bucket ----------
+
+// ModelBucket 单桶视图 (用户多桶 hero / 模型切换提示用)
+//
+// 字段语义:
+//   TokenQuota / TokenUsed / TokenRemaining 单位均为 ETU (折算后), 不是原始 token。
+//   要展示原始 token 估算, 用 ListCoefficients 拿到的 OutputCoef 反向除。
+//
+// BucketClass:
+//   "COMMERCIAL" — 套餐授予的精确桶 (model_id 精确匹配)
+//   "GENERIC"    — 注册/邀请/月度免费的通配桶 (model_id="*", 限白名单模型)
+type ModelBucket struct {
+	BucketID           string  `json:"bucketId"`
+	EntitlementID      string  `json:"entitlementId"`
+	ModelID            string  `json:"modelId"`     // "*" = 通配
+	BucketClass        string  `json:"bucketClass"` // COMMERCIAL / GENERIC
+	TokenQuota         int64   `json:"tokenQuota"`
+	TokenUsed          int64   `json:"tokenUsed"`
+	TokenRemaining     int64   `json:"tokenRemaining"`
+	CallQuota          int     `json:"callQuota"`
+	CallUsed           int     `json:"callUsed"`
+	CallRemaining      int     `json:"callRemaining"`
+	CoefficientVersion int     `json:"coefficientVersion"`
+	AllowedModelsJSON  string  `json:"allowedModelsJson,omitempty"`
+}
+
+// ModelByQuotaResponse GetByModel 响应; PrimaryBucket 在 BucketID 为空时表示无可用桶。
+type ModelByQuotaResponse struct {
+	ModelID           string      `json:"modelId"`
+	ETURemaining      int64       `json:"etuRemaining"`      // 折算后剩余 (调度判定用)
+	RawTokenRemaining int64       `json:"rawTokenRemaining"` // 反系数估算的原始 token (UI 展示用)
+	HasQuota          bool        `json:"hasQuota"`
+	PrimaryBucket     *ModelBucket `json:"primaryBucket,omitempty"`
+}
+
+// ModelCoefficient 单条模型系数 (SDK TTL 8s 缓存源)
+type ModelCoefficient struct {
+	ModelID           string  `json:"modelId"`
+	TenantID          string  `json:"tenantId"`
+	InputCoef         float64 `json:"inputCoef"`
+	OutputCoef        float64 `json:"outputCoef"`
+	CacheReadCoef     float64 `json:"cacheReadCoef"`
+	CacheCreationCoef float64 `json:"cacheCreationCoef"`
+	Version           int     `json:"version"`
+	EffectiveAt       string  `json:"effectiveAt"`
 }
 
 // ConsumeRecordPage 核销记录分页响应
