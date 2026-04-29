@@ -19,6 +19,7 @@
   - [4.9 通知管理](#49-通知管理)
   - [4.10 设备注册 (推送通知)](#410-设备注册-推送通知)
   - [4.11 通知偏好](#411-通知偏好)
+  - [4.12 CrabCode bug 报告](#412-crabcode-bug-报告-v30-v0170)
 - [5. CLI 命令手册](#5-cli-命令手册)
 - [6. 数据类型参考](#6-数据类型参考)
 - [7. 完整示例](#7-完整示例)
@@ -1088,6 +1089,90 @@ client.UpdateNotificationPreference(ctx, "tk_alert", acosmi.NotificationPreferen
 })
 ```
 
+### 4.12 CrabCode bug 报告 (V30, v0.17.0+)
+
+> scope: `account` (任意已登录 token 即可, 不需新增 scope)
+> 端点: `POST /api/v4/crabcode_cli_feedback` + `GET /api/v4/crabcode/bug/:id`
+
+CrabCode CLI `/bug` `/feedback` 命令落库通道. 设计目标是让"用户报 bug"独立成环 — 客户端把整段 reportData
+(含 description / 环境 / transcript / errors) 提交后, 后端做密钥脱敏并写 PG JSONB, 返回 `feedback_id` +
+公开 `detail_url`. 维护者把 `detail_url` 附在 GitHub Issue body 里, 跨租户/无登录可读.
+
+```go
+// 1. 上报 bug — reportData 任意 JSON 可编码对象, 后端只解析为 map 做脱敏 + 字段抽取,
+//    不做严格 schema 校验 (字段会随客户端版本变).
+report := map[string]any{
+    "description":   "调 ChatStream 偶发 504",
+    "platform":      "darwin",
+    "terminal":      "iTerm.app",
+    "version":       "v0.1.0",
+    "datetime":      time.Now().UTC().Format(time.RFC3339),
+    "message_count": 12,
+    "transcript":    transcript,    // []map[string]any
+    "errors":        []map[string]any{{"error": "EOF", "timestamp": "..."}},
+    "lastApiRequest": lastReq,
+    "rawTranscriptJsonl": rawJSONL,
+}
+result, err := client.SubmitBugReport(ctx, report)
+fmt.Println(result.FeedbackID)  // <uuid>
+fmt.Println(result.DetailURL)   // https://acosmi.com/chat/crabcode/bug/<uuid>
+
+// 2. 取公开 ViewModel (无需 auth — SSR 页面后端 / 维护者 CLI 都用)
+view, err := client.GetBugReport(ctx, "<uuid>")
+fmt.Println(view.Description, view.Status, len(view.Transcript))
+```
+
+**脱敏规则** — 后端服务层在落库前对 reportData 内**所有 string 叶子节点**应用以下正则, 替换为 `[REDACTED:<kind>]`:
+
+| Kind | Pattern | 示例 |
+|------|---------|------|
+| anthropic-key | `sk-ant-[A-Za-z0-9_\-]{20,}` | `sk-ant-api03-...` |
+| openai-key | `sk-(?:proj-)?[A-Za-z0-9_\-]{20,}` | `sk-proj-...` / `sk-...` |
+| github-token | `gh[psour]_[A-Za-z0-9]{20,}` | `ghp_...` / `ghs_...` |
+| aws-akid | `AKIA[0-9A-Z]{16}` | `AKIAIOSFODNN7EXAMPLE` |
+| google-api-key | `AIza[0-9A-Za-z_\-]{35}` | `AIzaSy...` |
+| bearer | `(?i)bearer\s+[A-Za-z0-9_\-\.=]{20,}` | `Authorization: Bearer ...` |
+
+调用方**不应**自己做脱敏后再发 — 让服务端兜底是统一规则的来源.
+
+**错误处理**:
+
+```go
+result, err := client.SubmitBugReport(ctx, report)
+if err != nil {
+    var he *acosmi.HTTPError
+    if errors.As(err, &he) {
+        switch {
+        case he.StatusCode == 401:
+            // token 过期, 触发 LoginWithHandler 重新拿 token
+        case he.StatusCode == 403 && he.Type == "permission_error" &&
+             strings.Contains(he.Message, "Custom data retention settings"):
+            // 用户所在组织 ZDR — 不能上报, 提示用户复制日志走外部渠道
+        case he.StatusCode == 400 && he.Type == "invalid_request_error":
+            // reportData 编码失败 (内含 unmarshalable types) → 客户端自查
+        case he.StatusCode == 429:
+            // 限流 20/h/user, RetryAfter 秒数遵循
+        }
+    }
+}
+```
+
+**限流**: POST 端点 `20/h/user` (per-userID), GET 端点 `60/min/IP`. 重试不放过 1 小时窗.
+
+**字段保留约束**: PG JSONB 单行 1GB 上限. 实际 transcript 多 MB 级无压力. 客户端无须自行截断 — 但建议
+`rawTranscriptJsonl` 在客户端先截到 `MAX_TRANSCRIPT_READ_BYTES` (CrabCode CLI 已默认这么做).
+
+**未实现 SDK 方法之前** (v0.16.x 及以下), 可以直接 HTTP 直调:
+
+```go
+body, _ := json.Marshal(map[string]string{"content": string(mustJSON(reportData))})
+req, _ := http.NewRequestWithContext(ctx, "POST",
+    "https://acosmi.com/api/v4/crabcode_cli_feedback", bytes.NewReader(body))
+req.Header.Set("Authorization", "Bearer "+accessToken)
+req.Header.Set("Content-Type", "application/json")
+// ... do + parse {feedback_id, detail_url}
+```
+
 ---
 
 ## 5. CLI 命令手册
@@ -1559,6 +1644,36 @@ type DeviceRegistration struct {
 func ParseNotificationEvent(ev WSEvent) *Notification // 返回 nil 表示非通知
 ```
 
+### CrabCode bug 报告 (V30, v0.17.0+)
+
+```go
+// 提交结果 — POST /api/v4/crabcode_cli_feedback 返回体
+type BugReportResult struct {
+    FeedbackID string `json:"feedback_id"`  // 服务端生成的 UUID
+    DetailURL  string `json:"detail_url"`   // https://<base>/chat/crabcode/bug/<id>
+}
+
+// 公开 ViewModel — GET /api/v4/crabcode/bug/:id 返回体
+type BugView struct {
+    ID             string         `json:"id"`
+    Description    string         `json:"description"`               // 已脱敏
+    Platform       string         `json:"platform,omitempty"`        // darwin | linux | win32
+    Terminal       string         `json:"terminal,omitempty"`        // iTerm.app / Terminal.app
+    Version        string         `json:"version,omitempty"`         // CrabCode 版本号
+    MessageCount   int            `json:"messageCount"`
+    HasErrors      bool           `json:"hasErrors"`
+    Status         string         `json:"status"`                    // new | triaging | fixed | wontfix
+    ClientDatetime *time.Time     `json:"clientDatetime,omitempty"`  // 客户端 reportData.datetime
+    CreatedAt      time.Time      `json:"createdAt"`
+    Errors         []any          `json:"errors,omitempty"`          // 已脱敏
+    Transcript     []any          `json:"transcript,omitempty"`      // 已脱敏 (前端默认折叠)
+    Extras         map[string]any `json:"extras,omitempty"`          // 其它非主字段 (rawTranscriptJsonl / lastApiRequest 等)
+}
+```
+
+> Errors / Transcript / Extras 用 `[]any` / `map[string]any`: 客户端 reportData schema 会随版本变,
+> SDK 不强 typed; 调用方按需做 type assertion.
+
 ### 错误
 
 ```go
@@ -1867,6 +1982,30 @@ make install    # → $GOPATH/bin
 ---
 
 ## 12. 版本记录
+
+### v0.17.0 (2026-04-29) — V30 CrabCode bug 报告 (📝 文档先于代码)
+
+> 文档先发布的版本; 网关端点已上线生产 (https://acosmi.com), SDK Go 方法 (`SubmitBugReport` / `GetBugReport`)
+> 与对应类型 (`BugReportResult` / `BugView`) 在下一个 commit 落地, 标记 v0.17.0. 下游可先按文档 HTTP 直调,
+> SDK 落地后切签名零迁移成本.
+
+- **新端点**:
+  - `POST /api/v4/crabcode_cli_feedback` — Bearer JWT (复用 `account` scope), 限流 20/h/user
+  - `GET /api/v4/crabcode/bug/:bug_id` — 公开 (无 auth), 限流 60/min/IP, Next.js SSR 页面 `https://<base>/chat/crabcode/bug/:id` fetch 此端点渲染
+- **新方法**:
+  - `Client.SubmitBugReport(ctx, reportData any) (*BugReportResult, error)` — reportData 任意 JSON 可编码对象, 后端只解析为 map 用于脱敏 + 字段抽取
+  - `Client.GetBugReport(ctx, bugID string) (*BugView, error)` — 公开读取, 任意 token 即可
+- **新类型**: `BugReportResult` / `BugView` (见 §6 "CrabCode bug 报告")
+- **服务端脱敏**: 6 类正则 (anthropic-key / openai-key / github-token / aws-akid / google-api-key / bearer)
+  在落库前对 reportData 内**所有 string 叶子节点**生效, 调用方无须自行做密钥过滤
+- **存储**: PG JSONB 单行 1GB, MB 级 transcript 无压力; 不走 ObjectStorage (接口缺 Download 方法,
+  公开页 SSR 拿不到内容; PG 单次 SELECT 取出更直接)
+- **detail_url 含 /chat/ 前缀**: Next.js basePath=/chat 是 acosmi web 主路径仓约定. GitHub Issue body
+  里出现 `https://acosmi.com/chat/crabcode/bug/<uuid>` 是预期行为
+- **scope 不变**: 复用 `account`, **不**新增 `bug` / `feedback` scope (维持 ai/skills/account 三 scope 简化设计)
+- **ZDR 钩子**: `BugService.IsZDRUser` 默认返回 false; 启用 ZDR 时由调用方覆盖, 拒绝时返 403 +
+  `permission_error` 含关键字 "Custom data retention settings" (客户端按 includes 判断)
+- **调用方迁移**: HTTP 直调 → SDK 方法 0 改动 (字段映射一致); 现存 `acosmi_cli_feedback` 类老路径仓里**没有**, 无 301 兼容
 
 ### v0.16.0 (2026-04-28)
 
