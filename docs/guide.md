@@ -1,6 +1,6 @@
 # Acosmi Go SDK 开发手册
 
-> v0.16.0 | Go 1.22+ | MIT
+> v0.19.0 | Go 1.22+ | MIT
 
 ## 目录
 
@@ -247,12 +247,71 @@ go client.WSConnect(ctx)         // 等待 → 拿到 token → 升级握手
 #### 模型列表
 
 ```go
-models, _ := client.ListModels(ctx)
+// 推荐: 拿 entitlement 过滤状态用于 UI 降级提示 (v0.18.1+)
+models, status, err := client.ListModelsWithStatus(ctx)
+if err != nil { /* ... */ }
 for _, m := range models {
     fmt.Printf("%s (%s/%s) 上下文:%d 输出:%d\n",
         m.Name, m.Provider, m.ModelID, m.ContextWindow, m.MaxTokens)
+    if m.BucketInfo != nil {
+        // V0.18+: 用户已购模型自带余量信息. 推荐用 IsCommercial() 大小写不敏感判定
+        kind := "generic"
+        if m.BucketInfo.IsCommercial() { kind = "commercial" }
+        fmt.Printf("  剩余 %d ETU (共 %d), %s 桶, 共享池 %d ETU\n",
+            m.BucketInfo.RemainingEtu, m.BucketInfo.QuotaEtu, kind, m.BucketInfo.SharedPoolEtu)
+    }
 }
+// 据 status 决定 UI 降级提示
+switch status {
+case acosmi.FilterStatusOK: // 正常按 entitlement 过滤, 余量字段可用
+case acosmi.FilterStatusFallbackTkdistError, acosmi.FilterStatusFallbackTkdistSkew:
+    // tk-dist 上游不可达或部署版本错位, UI toast: "服务降级, 模型列表临时显示全部"
+case acosmi.FilterStatusDisabledByFlag:
+    // 运维灰度回滚中, 不显示 BucketInfo
+}
+
+// 兼容: 不关心 status 的旧调用方式仍可用 (向后兼容, 不会废弃)
+models, _ = client.ListModels(ctx)
 ```
+
+> **V0.18+ Entitlement 过滤行为** (V30 → V30 二轮 2026-04-29):
+>
+> `ListModels` 返回的列表**只包含调用方当前用户已购套餐内的模型**, 而非平台全量。商品创建时勾选的模型集合直接透传到 SDK, 客户端无需自己过滤。
+>
+> **V30 二轮架构变更 (v0.18.1)**: 端点超载分离, admin 后台必须改调 `/api/v4/managed-models/admin` 拿完整视图; SDK 用户调 `ListModels` (即 `mm.GET ""`) 即便是 admin role 也会**走 entitlement 过滤** — 跨权拿 platform 全量+敏感字段 (endpoint/providerConfig/pricing) 已在 V30 二轮根治.
+>
+> | 调用方 | 端点 | 行为 | BucketInfo |
+> |---|---|---|---|
+> | 普通用户 (web JWT) | `mm.GET ""` (即 SDK ListModels) | 返**用户已购模型并集** | 非 nil, 含 quota/used/remaining/bucketClass/expiresAt |
+> | desktop OAuth `models` scope | `mm.GET ""` | 同普通用户 (admin role 也过滤) | 非 nil |
+> | 内部测试 (X-Internal-Bypass header + 配置密钥) | `mm.GET ""` | 返全量 | nil |
+> | tk-dist 不可达 (fail-OPEN 兜底) | `mm.GET ""` | 返全量 | nil |
+> | V9 老用户无桶记录 (灰度兜底) | `mm.GET ""` | 返全量 | nil |
+> | Web admin 后台 (浏览器登录) | `/admin` (新端点, SDK 不调用) | 返完整 ManagedModelResponse + 含 disabled | n/a |
+>
+> **响应头 `X-Entitlement-Filter-Status`** (通过 `ListModelsWithStatus` 返回的 `FilterStatus` 暴露). 取值与 `acosmi.FilterStatus*` 常量一一对应:
+> - `FilterStatusOK` (`ok`): 正常按用户 entitlement 过滤
+> - `FilterStatusAdminBypass` (`admin-bypass`): SDK 用户**永不会拿到** (V30 二轮后只有 ListAdmin 端点会, SDK 不调用)
+> - `FilterStatusInternalBypass` (`internal-bypass`): X-Internal-Bypass header 命中 (CI/bot)
+> - `FilterStatusDisabledByFlag` (`disabled-by-flag`): 运维 ENV 灰度回滚中
+> - `FilterStatusFallbackTkdistError` (`fallback-tkdist-error`): tk-dist RPC 失败 fail-OPEN, UI toast 提示
+> - `FilterStatusFallbackTkdistSkew` (`fallback-tkdist-deployment-skew`): tk-dist 返 404, Java 部署版本未升级 V30, **SRE 信号**
+> - `FilterStatusFallbackNoBuckets` (`fallback-no-buckets`): V9 老用户 fallback
+> - `FilterStatusFallbackMissingUser` (`fallback-missing-userid`): 防御性, 不应出现
+> - `FilterStatusUnknown` (`""`): 未知/缺失 (调用了老 nexus, header 不存在 — 按 v0.17 行为兜底)
+>
+> **多桶聚合规则**:
+> - `QuotaEtu/UsedEtu/RemainingEtu`: 该 modelId 下用户全部 active 桶求和
+> - `SharedPoolEtu` (v0.18+): 求和量中"来自通配桶 (model_id='*')"的部分; 该值会被其他模型联动消耗 — UI 推荐分两栏显示"自有 + 共享池"
+> - `BucketClass/ExpiresAt`: 取最高优先级桶 (alive > expired > commercial > exact > expiresAt 早)
+> - `Expired`: 全部桶都过期才置 true
+>
+> **典型场景**:
+> - 平台 5 模型 a/b/c/d/e, 用户买了 a/b 套餐 → ListModels 返 2 个 (a/b), 选 c/d/e 时上层 UI 不显示
+> - 用户买套餐 1 (a/b 1000ETU) + 套餐 2 (e/f 500ETU) → ListModels 返 4 个, 各自带对应桶余额
+> - 用户对模型 a 有精确桶 1000 + 通配桶 500 (allowedModels=[a,b,c]) → ListModels 返 a 的 BucketInfo `QuotaEtu=1500, SharedPoolEtu=500`, 用户跑 b 也会让 a 的"剩余"下降 (这是设计, UI 应明示)
+
+> ⚠️ **strict-mode 反序列化客户端注意**: v0.18 在 `ManagedModel` 新增 `BucketInfo *BucketInfo` 字段。若调用方用 `json.NewDecoder + DisallowUnknownFields()` 严格解码,**老 v0.17 schema 客户端在升级到 v0.18 nexus 后会拒绝解析含 bucketInfo 的响应**。lenient (默认 `json.Unmarshal`) 客户端不受影响。
 
 #### 模型能力查询
 
@@ -928,6 +987,84 @@ if resp.ModelTokenRemaining >= 0 {
 - GENERIC 桶模型受 `AllowedModelsJSON` 白名单限制,调白名单外的模型会 403 `MODEL_NOT_ALLOWED`
 - 灰度期老用户 entitlement 可能无桶 (`ListBuckets` 返回空), 此时仍走 legacy 单池路径,不影响 Chat 调用
 
+#### V0.19: 钱包总览 — 免费/付费切分 (v0.19.0+)
+
+**痛点**: V29 暴露的是"按 modelId 聚合"或"全部桶 raw 列表", 个人中心钱包栏想一次显示
+"我还有 X 万免费 Token + Y 万付费 Token, 各自最近 Z 天到期"必须客户端自己 filter+sum,
+易写错且每个调用方重复实现.
+
+**解决**: 新增 `GetQuotaSummary` 端点 + SDK 一次拿账户级钱包视图.
+
+```go
+// 个人中心钱包栏一次拿全
+sum, err := client.GetQuotaSummary(ctx)
+if err != nil {
+    return err
+}
+
+// 总额 — 仅 alive 桶 (即真实可消费余额, 与 RemainingEtu 含过期不同)
+fmt.Printf("免费余额: %d ETU\n", sum.FreeTotalEtu)
+fmt.Printf("付费余额: %d ETU\n", sum.PaidTotalEtu)
+
+// 最近到期 — 双字段允许分别提示, 单字段会折叠掉一种维度
+if sum.NextFreeExpiresAt != nil {
+    days := int(time.Until(*sum.NextFreeExpiresAt).Hours() / 24)
+    fmt.Printf("免费余额 %d 天后到期\n", days)
+}
+if sum.NextPaidExpiresAt != nil {
+    days := int(time.Until(*sum.NextPaidExpiresAt).Hours() / 24)
+    fmt.Printf("付费余额 %d 天后到期\n", days)
+}
+
+// 详细桶列表 — 含过期 (UI 列流水/历史/标"已过期")
+for _, b := range sum.FreeBuckets {
+    status := "alive"
+    if b.Expired { status = "expired" }
+    fmt.Printf("  [%s] %s: %d/%d (%s)\n", b.BucketClass, b.BucketID, b.TokenRemaining, b.TokenQuota, status)
+}
+```
+
+**字段映射**:
+
+| 字段 | 含义 | alive-only |
+|------|------|------------|
+| `FreeTotalEtu` | GENERIC 桶 (月度免费/邀请/试用) tokenRemaining 求和 | ✅ |
+| `PaidTotalEtu` | COMMERCIAL 桶 (购买套餐) tokenRemaining 求和 | ✅ |
+| `FreeBuckets[]` | GENERIC 桶详情 (含过期, UI 列流水) | ❌ 含全部 |
+| `PaidBuckets[]` | COMMERCIAL 桶详情 (含过期) | ❌ 含全部 |
+| `NextFreeExpiresAt` | GENERIC alive 桶最早到期 (永久桶不参与) | ✅ |
+| `NextPaidExpiresAt` | COMMERCIAL alive 桶最早到期 | ✅ |
+
+**与 BucketInfo (per-model) 的区别**:
+
+| 维度 | `ManagedModel.BucketInfo` (V0.18) | `QuotaSummary` (V0.19) |
+|------|-----------------------------------|------------------------|
+| 粒度 | 单 modelId 聚合 | 整账户全局 |
+| `RemainingEtu` 语义 | 含过期桶 (历史 UX 兼容) | N/A (拆成 FreeTotalEtu/PaidTotalEtu, 仅 alive) |
+| 用例 | 模型选择器卡片 "a 模型还能用多少" | 个人中心 "我整体还有多少钱" |
+| 走 entitlement 过滤 | ✅ (V30 二轮: 永远过滤) | ❌ (用户必须看自己钱包全量) |
+
+**ManagedModel.BucketInfo 同步增强 (v0.19+)**: 单模型卡片也加了 `FreeRemainingEtu` /
+`PaidRemainingEtu` 字段 (alive-only), 推荐用这两个新字段而非 `RemainingEtu`:
+
+```go
+models, _ := client.ListModels(ctx)
+for _, m := range models {
+    if m.BucketInfo == nil { continue }
+    // 新方式 (推荐, alive-only)
+    fmt.Printf("%s: 免费 %d + 付费 %d ETU 可用\n",
+        m.ModelID, m.BucketInfo.FreeRemainingEtu, m.BucketInfo.PaidRemainingEtu)
+    // 老方式 (含过期, 仅向后兼容)
+    // fmt.Printf("%s: %d ETU\n", m.ModelID, m.BucketInfo.RemainingEtu)
+}
+```
+
+**鉴权**: JWT 或 Desktop OAuth (`entitlements` scope) — 与 ListBuckets 同 group.
+
+**失败语义**: tk-dist 不可达/5xx → 500 + non-nil err; 空桶用户 (V9 老用户/未购未领) → 200 + 全 0 + 空切片 (`FreeBuckets/PaidBuckets` 永不为 nil, 前端不需 null 检查).
+
+**缓存提醒**: SDK 不内置缓存 — 调用方自行节流, 建议 ≥ 30s/account (个人中心刷新够用).
+
 ### 4.5 流量包商城
 
 > scope: `ai`
@@ -1254,9 +1391,48 @@ type ManagedModel struct {
     IsEnabled, IsDefault        bool
     PricePerMTok                float64
     Capabilities                ModelCapabilities
-    SupportedFormats            []string // v0.10.0: ["anthropic","openai"], 上游可选
-    PreferredFormat             string   // v0.10.0: "anthropic" | "openai", 空则取 SupportedFormats[0]
+    SupportedFormats            []string    // v0.10.0: ["anthropic","openai"], 上游可选
+    PreferredFormat             string      // v0.10.0: "anthropic" | "openai", 空则取 SupportedFormats[0]
+    BucketInfo                  *BucketInfo // v0.18.0: 用户余量聚合, admin / fallback 路径为 nil
 }
+
+// V0.18.0 V30 entitlement-listing
+type BucketInfo struct {
+    QuotaEtu      int64      `json:"quotaEtu"`      // 该 modelId 全部桶配额求和 (单位 ETU)
+    UsedEtu       int64      `json:"usedEtu"`
+    RemainingEtu  int64      `json:"remainingEtu"`
+    SharedPoolEtu int64      `json:"sharedPoolEtu,omitempty"` // 来自通配桶的求和子集, 跨模型可消耗
+    ExpiresAt     *time.Time `json:"expiresAt,omitempty"`     // primary 桶到期; nil = 永久
+    BucketClass   string     `json:"bucketClass"`             // BucketClassCommercial | BucketClassGeneric
+    Expired       bool       `json:"expired,omitempty"`       // 全部桶都过期
+}
+
+// V0.18.1 V30 二轮审计 D-P1-3: BucketClass 字面量常量, 推荐用 IsCommercial() 大小写不敏感比较
+const (
+    BucketClassCommercial = "COMMERCIAL"
+    BucketClassGeneric    = "GENERIC"
+)
+func (b *BucketInfo) IsCommercial() bool // nil-safe; 与上游 EqualFold 对齐, 字面量大小写不敏感
+
+// V0.18.1 V30 二轮审计 D-P1-2: ListModels 响应头 X-Entitlement-Filter-Status 类型化暴露
+type FilterStatus string
+
+const (
+    FilterStatusOK                  FilterStatus = "ok"
+    FilterStatusAdminBypass         FilterStatus = "admin-bypass"                    // SDK 调用永不命中 (V30 二轮端点超载分离后)
+    FilterStatusInternalBypass      FilterStatus = "internal-bypass"                 // CI/bot 后门
+    FilterStatusDisabledByFlag      FilterStatus = "disabled-by-flag"                // 运维 ENV 灰度回滚
+    FilterStatusFallbackTkdistError FilterStatus = "fallback-tkdist-error"           // tk-dist RPC 失败
+    FilterStatusFallbackTkdistSkew  FilterStatus = "fallback-tkdist-deployment-skew" // tk-dist 404 部署版本错位
+    FilterStatusFallbackNoBuckets   FilterStatus = "fallback-no-buckets"             // V9 老用户
+    FilterStatusFallbackMissingUser FilterStatus = "fallback-missing-userid"         // 防御性, 不应出现
+    FilterStatusUnknown             FilterStatus = ""                                // 老 nexus / 未知
+)
+
+// 推荐: 拿 status 用于 UI 降级提示
+func (c *Client) ListModelsWithStatus(ctx context.Context) ([]ManagedModel, FilterStatus, error)
+// 兼容: 不关心 status 的旧调用 (向后兼容)
+func (c *Client) ListModels(ctx context.Context) ([]ManagedModel, error)
 
 type ModelCapabilities struct {
     // 思考能力
@@ -1982,6 +2158,124 @@ make install    # → $GOPATH/bin
 ---
 
 ## 12. 版本记录
+
+### v0.19.0 (2026-04-29) — 钱包总览 + 免费/付费切分 (V30 后续增量)
+
+**背景**: V30 一二轮把 ListModels 接通了 entitlement, 但 SDK 用户实际 UI 渲染时发现痛点:
+后端虽分了 COMMERCIAL/GENERIC 桶, SDK 暴露的余量字段是单字段 `RemainingEtu` 含过期 — 个人中心
+钱包栏想一次显示"我还有 X 万免费 + Y 万付费 Token, 各自 Z 天到期"必须客户端 filter+sum, 易写错且每个调用方重复实现.
+
+**SDK 端新增 (向后兼容)**:
+- 新类型 `QuotaSummary` + `BucketRow` + `client.GetQuotaSummary(ctx)` — 个人中心钱包栏一次拿全, 含 FreeTotalEtu/PaidTotalEtu/FreeBuckets[]/PaidBuckets[]/NextFreeExpiresAt/NextPaidExpiresAt 6 字段 (alive-only 总额 + 含过期详情列表 + 双独立到期字段).
+- `BucketInfo` 新增 `FreeRemainingEtu` / `PaidRemainingEtu` 字段 (alive-only, 即真实可消费余额); 旧 `RemainingEtu` 保留但标注"含过期, 历史 UX 兼容, 推荐用 Free/Paid".
+- `BucketRow.IsCommercial()` 大小写不敏感判定 (与 `BucketInfo.IsCommercial` 同语义).
+
+**配套 nexus-v4 backend**:
+- 新端点 `GET /api/v4/entitlements/quota-summary` (复用 EntitlementHandler.tkdistClient, 走 AuthOrDesktopScope `entitlements` 同 group).
+- `aggregateBucketInfo` 注入 alive-only `FreeRemainingEtu` / `PaidRemainingEtu` 到 `BucketInfoResponse`, ListModels 响应每模型卡片现在带 6 字段 (旧 4 + 新 2).
+
+**设计决策 (调研 web/profile + EntitlementServiceImpl + filterModelsByEntitlement 后定):**
+1. **命名 = Free/Paid**: 前端 i18n 已用 `'月度免费'/'付费套餐'/'免费试用'`, 用户视角而非 internal `Generic/Commercial`.
+2. **expired 桶 = alive-only**: Java 端 `selectBucketForUpdate` 不消费过期桶, 新字段 alive-only 才是真实可消费余额; 旧 `RemainingEtu` 含过期保兼容.
+3. **不过滤**: 用户看自己钱包总览必须全量 — `QuotaSummary` 端点不走 entitlement 过滤逻辑.
+4. **NextExpiresAt 双字段**: 单字段会折叠"免费 X 天到期 vs 付费 Y 天到期"两条独立 UI 提示能力, 双字段允许分别提示.
+
+**部署 sequence**:
+1. 先发 SDK v0.19.0 (向后兼容, 老 v0.18.1 客户端调新/老 nexus 都正常 — 新字段反序列化为 0/nil).
+2. 部署 nexus-v4 backend (架构 + 端点补齐) — tk-dist 零修改.
+3. 前端按需切到新字段 (老 `RemainingEtu` 仍可用, 不阻塞).
+
+**示例**:
+```go
+sum, _ := client.GetQuotaSummary(ctx)
+fmt.Printf("免费: %d ETU (%v 到期) | 付费: %d ETU (%v 到期)\n",
+    sum.FreeTotalEtu, sum.NextFreeExpiresAt,
+    sum.PaidTotalEtu, sum.NextPaidExpiresAt)
+```
+
+### v0.18.1 (2026-04-29) — V30 二轮审计闭环 (架构根因修复 + 安全加固)
+
+**背景**: V30 一轮审计闭环 22 项后, 二轮代码层深度复核发现端点超载、时序攻击、scope 双写、ctx 不透传、tk-dist 端点无认证 等架构根因问题. 此版本是与 nexus-v4 backend / tk-dist 同步的根因修复, **零破坏**, SDK 用户可直接升级.
+
+**SDK 端新增 (向后兼容)**:
+- `BucketClassCommercial` / `BucketClassGeneric` 常量 + `BucketInfo.IsCommercial()` 帮助方法 (大小写不敏感, 与上游 EqualFold 对齐). 推荐 SDK 用户用 `b.IsCommercial()` 而非 `b.BucketClass == "commercial"` 字面量比较.
+- `ListModelsWithStatus(ctx) ([]ManagedModel, FilterStatus, error)` — 暴露 `X-Entitlement-Filter-Status` header. UI 可据此判定 `FilterStatusFallbackTkdistError` / `FilterStatusFallbackTkdistSkew` / `FilterStatusDisabledByFlag` 等降级状态, 渲染相应 toast.
+- `FilterStatus` 类型 + 9 个常量 (Ok / AdminBypass / InternalBypass / DisabledByFlag / FallbackTkdistError / FallbackTkdistSkew / FallbackNoBuckets / FallbackMissingUser / Unknown).
+- 4 新单测 (Expired+Remaining>0 透传 / 非-Z 时区 / SharedPool>Remaining 透传 / IsCommercial 大小写).
+
+**SDK 端不变**:
+- `ListModels(ctx) ([]ManagedModel, error)` 行为完全保留 — 新方法不替代旧方法, 老调用方零修改可用.
+- 所有 BucketInfo 字段 (QuotaEtu/UsedEtu/RemainingEtu/SharedPoolEtu/ExpiresAt/BucketClass/Expired) wire format 完全不变.
+
+**配套上游修复 (用户感知零变化, 此处仅供 SRE/审计参考)**:
+- nexus-v4 backend 端点超载分离: admin 后台改调 `/api/v4/managed-models/admin` 拿完整视图, `mm.GET ""` 收敛为永远 PublicResponse + 永远过滤 (除 X-Internal-Bypass header). `ShouldFilterByEntitlement` 删除 IsAdmin/desktop_client_id 分支.
+- nexus-v4 `subtle.ConstantTimeCompare` 防 X-Internal-Bypass 时序攻击.
+- nexus-v4 `effectiveBypassSecret` 删除 fallback S2SSecret (零信任, 必须显式 `ENTITLEMENT_FILTER_BYPASS_SECRET` ENV).
+- nexus-v4 `BucketRow.ExpiresAt` string → `*time.Time` (锚定 ISO-8601 契约, epoch ms 数字 fail-fast).
+- nexus-v4 `ListBucketsTyped(ctx, ...)` 接 ctx, 客户端断连立即终止 RPC + retry, 不再空耗.
+- nexus-v4 `InitEntitlementListMetrics` 失败 fail-fast 启动 panic, 不再静默丢失 attack 信号; `/health` 端点暴露 `entitlement_metrics_ready`.
+- nexus-v4 fallback 区分: tk-dist 404 (Java 部署版本错位) 走 `fallback-tkdist-deployment-skew` header 让 SRE 立刻识别; metric outcome 仍归 `fallback_tkdist_error` 防基数膨胀.
+- tk-dist `/api/entitlements/buckets` 加 S2sAuthInterceptor + permit-all 双侧加固 (V29 遗留漏洞, V30 暴露面放大). 同期顺手堵 `list/by-model/consume-records/coefficients/balance/balance-detail` 6 个 V29 同类裂缝端点.
+- tk-dist `EntitlementController.adminList` 加 `@PreAuthorize` 守卫 (V29 任意用户枚举权益漏洞).
+- tk-dist HashMap 容量预设防 rehash (重度老用户 1000+ 桶场景).
+
+**部署 sequence**:
+1. 先发 SDK v0.18.1 (向后兼容, 零破坏 — 老 v0.18.0 客户端调老/新 nexus 都正常)
+2. 部署 tk-dist (Java 端点认证补齐) — 必须先于 nexus, 否则 nexus 调 buckets 会被新 S2sAuthInterceptor 拦
+3. 部署 nexus-v4 backend (architecture refactor) — 需重启所有实例
+4. 部署 web admin UI (page.tsx 切到 `/api/v4/managed-models/admin`) — 与 backend 同步发避免 admin 看不到 disabled 模型
+
+**紧急回滚**:
+- nexus-v4: `ENTITLEMENT_LIST_FILTER_ENABLED=false` 一键回 v0.17 行为 (重启实例生效, **非热回滚**, 文档已修措辞)
+- tk-dist: 回滚 application.yaml + DistributionWebMvcConfiguration 即可
+
+### v0.18.0 (2026-04-29) — V30 Entitlement-Listing (ListModels 按用户权益过滤)
+
+> **行为变化, 但向后兼容**: `ListModels` 对非 admin 用户**只返已购模型**而非平台全量, `ManagedModel` 新增 `BucketInfo *BucketInfo` 字段携带余量。strict-mode 反序列化客户端需先升级 SDK 再升级 nexus, lenient 客户端可任意顺序。
+
+- **新行为 — `ListModels` entitlement 过滤** (上游 nexus-v4 V30):
+  - **admin/owner/super_admin**: 返 platform 全量, 不附 BucketInfo (后台管理视图)
+  - **普通用户 (web JWT / desktop OAuth `ai` scope)**: 返用户**已购套餐覆盖的模型并集**, 每个模型带 `BucketInfo`
+  - **fail-OPEN 容错**: tk-dist RPC 失败时返全量但不附 BucketInfo, Chat 阶段 `holdWithAutoSyncRetry` 兜底拒未授权模型
+  - **V9 老用户兼容**: 用户无 V29 桶记录时 fallback 返全量 (V30 全量迁移完成后撤掉, 见 backend `~2026-Q3` TODO)
+  - **响应头 `X-Entitlement-Filter-Status`**: `ok|admin-bypass|internal-bypass|disabled-by-flag|fallback-tkdist-error|fallback-no-buckets|fallback-missing-userid`, 客户端可据此 UI 提示降级
+
+- **新类型 `BucketInfo`** (types.go):
+  ```go
+  type BucketInfo struct {
+      QuotaEtu      int64      `json:"quotaEtu"`               // 该 modelId 全部桶配额求和 (ETU)
+      UsedEtu       int64      `json:"usedEtu"`
+      RemainingEtu  int64      `json:"remainingEtu"`
+      SharedPoolEtu int64      `json:"sharedPoolEtu,omitempty"` // 来自通配桶的求和子集, 跨模型可消耗
+      ExpiresAt     *time.Time `json:"expiresAt,omitempty"`     // primary 桶到期时间, nil = 永久
+      BucketClass   string     `json:"bucketClass"`             // COMMERCIAL | GENERIC
+      Expired       bool       `json:"expired,omitempty"`       // 全部桶都过期
+  }
+  ```
+  全部字段单位为 **ETU** (Equivalent Token Unit, V29 系数折算后), 不是 raw token. 与 `ListBuckets` / `GetByModel` 单位一致。
+
+- **`ManagedModel` 新增字段**: `BucketInfo *BucketInfo` (omitempty + 指针, admin / fallback 路径为 nil)
+
+- **多桶聚合算法** (上游计算, SDK 直接消费):
+  - quota/used/remaining/sharedPool 求和; bucketClass/expiresAt 取最高优先级桶
+  - 优先级: alive > expired → commercial > generic → exact > wildcard → expiresAt 早 > 永久
+  - 与 backend `selectBucketForUpdate` **近似**对齐 (typePriority 维度未跨进 SDK), 列表层用于展示, **不作消费决策依据** — 实际扣费仍由 Chat 阶段决定
+
+- **典型迁移场景**:
+  - 老 v0.17 调用方 `for _, m := range models { ... }` **零修改可用** — 不读 BucketInfo 即视作旧行为
+  - 想展示用户余量的客户端: 加 `if m.BucketInfo != nil { ... }` 即可读余量, 用 `Expired` 灰显
+  - **strict-mode 反序列化客户端必读**: 升级到 v0.18 SDK 后才能解析 nexus 0.18+ 响应 (新增 bucketInfo 字段会触发 unknown field 错误)
+
+- **不破坏旧客户端**: BucketInfo 是指针 + omitempty, 老 nexus / admin 路径不返此字段, 老 SDK 不读此字段, 任意组合都能工作
+
+- **release sequence (推荐)**:
+  1. SDK v0.18.0 先发布 (字段兼容性 SAFE, 单独发不破任何场景)
+  2. nexus 灰度: `ENTITLEMENT_LIST_FILTER_ENABLED=false` 部署 → 验证可观测指标 → 切 `=true`
+  3. 灰度 1 周观察 `chatacosmi_listmodels_entitlement_filter_total{outcome=*}` 与 `tkdist_buckets_latency` 指标
+  4. 通知下游应用可消费 BucketInfo 字段
+  5. CrabCode/CrabClaw 等 UI 客户端按需升级到 v0.18 SDK 并加 BucketInfo 渲染
+
+- **配套 backend 紧急回滚**: `ENTITLEMENT_LIST_FILTER_ENABLED=false` 即可恢复 v0.17 行为, 不需要重新部署 SDK
 
 ### v0.17.0 (2026-04-29) — V30 CrabCode bug 报告 (📝 文档先于代码)
 

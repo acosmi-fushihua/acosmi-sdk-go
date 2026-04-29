@@ -389,18 +389,84 @@ func (c *Client) ensureToken(ctx context.Context) (string, error) {
 // modelCacheTTL 模型列表缓存有效期
 const modelCacheTTL = 5 * time.Minute
 
-// ListModels 获取可用的托管模型列表
+// ListModels 获取可用的托管模型列表.
+//
+// V30 二轮审计 D-P1-2: 此方法不返回 entitlement-filter-status header. UI 想根据 fallback
+// 状态显示降级提示 (e.g. "tk-dist 离线, 临时显示全部模型"), 请改调 ListModelsWithStatus.
 func (c *Client) ListModels(ctx context.Context) ([]ManagedModel, error) {
+	models, _, err := c.ListModelsWithStatus(ctx)
+	return models, err
+}
+
+// FilterStatus 是 X-Entitlement-Filter-Status 响应头的取值集 (V30 二轮审计 D-P1-2 引入).
+//
+// 客户端用此区分: 正常过滤路径 (Ok) / 全量返回的多种降级原因 / 未知值 (上游版本更新引入新值时
+// fall through 到 FilterStatusUnknown 而非崩溃).
+//
+// 与 nexus-v4 backend setEntitlementFilterStatusHeader 字面量必须保持一致, 任一端漂移都会
+// 让 SDK 用户拿到 FilterStatusUnknown — UI 应该 graceful 处理而非硬编码完整集.
+type FilterStatus string
+
+const (
+	FilterStatusOK                   FilterStatus = "ok"                                  // 正常按用户 entitlement 过滤
+	FilterStatusAdminBypass          FilterStatus = "admin-bypass"                        // admin 路径 (V30 二轮后仅 ListAdmin 端点能命中)
+	FilterStatusInternalBypass       FilterStatus = "internal-bypass"                     // X-Internal-Bypass header 命中 (CI/bot)
+	FilterStatusDisabledByFlag       FilterStatus = "disabled-by-flag"                    // ENTITLEMENT_LIST_FILTER_ENABLED=false 灰度回滚
+	FilterStatusFallbackTkdistError  FilterStatus = "fallback-tkdist-error"               // tk-dist RPC 失败 fail-OPEN, UI 应 toast 提示
+	FilterStatusFallbackTkdistSkew   FilterStatus = "fallback-tkdist-deployment-skew"     // tk-dist 返 404 (V30 二轮 B-P1-D), 部署版本不一致, SRE 需查 tk-dist
+	FilterStatusFallbackNoBuckets    FilterStatus = "fallback-no-buckets"                 // V9 老用户无桶 fallback
+	FilterStatusFallbackMissingUser  FilterStatus = "fallback-missing-userid"             // 防御性, 应永远不出现
+	FilterStatusUnknown              FilterStatus = ""                                    // 未知/缺失 — 老 nexus / 非 V30 端点
+)
+
+// ListModelsWithStatus 获取可用模型列表, 同时返回 X-Entitlement-Filter-Status header.
+//
+// V30 二轮审计 D-P1-2: 老 ListModels 丢弃 header 让 SDK 用户无法识别 fail-OPEN 降级状态,
+// 此方法暴露 status 让 UI 可:
+//   - status == FilterStatusOK → 正常显示 BucketInfo 余量
+//   - status == FilterStatusFallbackTkdistError/Skew → 灰显余量 + toast "tk-dist 离线, 模型列表降级"
+//   - status == FilterStatusDisabledByFlag → 不显示余量 (运维灰度中)
+//   - status == FilterStatusUnknown → 老 nexus, 按老 v0.17 行为 (不显示 BucketInfo)
+//
+// 底层 BucketInfo 字段仅 status==Ok 时由上游填充, 其他状态下为 nil.
+func (c *Client) ListModelsWithStatus(ctx context.Context) ([]ManagedModel, FilterStatus, error) {
 	var resp APIResponse[[]ManagedModel]
-	if err := c.doJSON(ctx, http.MethodGet, "/managed-models", nil, &resp, false); err != nil {
-		return nil, err
+	header, err := c.doJSONFull(ctx, http.MethodGet, "/managed-models", nil, &resp)
+	if err != nil {
+		return nil, FilterStatusUnknown, err
 	}
 	// 写入模型缓存 (供 getCachedCapabilities / GetModelCapabilities 使用)
 	c.mu.Lock()
 	c.modelCache = resp.Data
 	c.modelCacheTime = time.Now()
 	c.mu.Unlock()
-	return resp.Data, nil
+
+	status := FilterStatusUnknown
+	if header != nil {
+		if h := header.Get("X-Entitlement-Filter-Status"); h != "" {
+			status = FilterStatus(h)
+		}
+	}
+	return resp.Data, status, nil
+}
+
+// GetQuotaSummary 查询当前用户账户级权益总览 (v0.19+).
+//
+// 返回 *QuotaSummary 含免费/付费各自总额 + 桶详情 + 各自最近到期时间.
+// 用于个人中心钱包栏: UI 一次拿完整钱包视图, 不需要遍历 ListModels 客户端聚合.
+//
+// 与 ListModels 的区别:
+//   - ListModels: 按 modelId 聚合 BucketInfo, 答"a 模型还能用多少", 走 entitlement 过滤
+//   - GetQuotaSummary: 账户级钱包概览, 答"我整体还有多少免费 + 付费", 不过滤 (用户必须看自己钱包)
+//
+// 鉴权: JWT 或 Desktop OAuth (entitlements scope).
+// 失败语义: tk-dist 不可达 → 500 + non-nil err; 空桶用户 → 200 + 全 0 + 空切片.
+func (c *Client) GetQuotaSummary(ctx context.Context) (*QuotaSummary, error) {
+	var resp APIResponse[QuotaSummary]
+	if err := c.doJSON(ctx, http.MethodGet, "/entitlements/quota-summary", nil, &resp, false); err != nil {
+		return nil, err
+	}
+	return &resp.Data, nil
 }
 
 // GetModelCapabilities 查询单个模型的能力矩阵
