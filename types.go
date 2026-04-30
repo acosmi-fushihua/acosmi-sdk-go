@@ -208,7 +208,7 @@ type QuotaSummary struct {
 // BucketRow 单桶视图 — QuotaSummary.FreeBuckets/PaidBuckets 元素.
 //
 // 是 BucketInfo 的"单桶版" (BucketInfo 是按 modelId 聚合后的视图, BucketRow 是单桶原始).
-// 不暴露 EntitlementID / CoefficientVersion / AllowedModelsJson (内部实现细节).
+// 不暴露 EntitlementID / AllowedModelsJson (内部实现细节).
 type BucketRow struct {
 	BucketID       string     `json:"bucketId"`
 	ModelID        string     `json:"modelId"`     // 精确桶为具体 modelId, 通配桶为 "*"
@@ -779,8 +779,8 @@ type ConsumeRecord struct {
 // ModelBucket 单桶视图 (用户多桶 hero / 模型切换提示用)
 //
 // 字段语义:
-//   TokenQuota / TokenUsed / TokenRemaining 单位均为 ETU (折算后), 不是原始 token。
-//   要展示原始 token 估算, 用 ListCoefficients 拿到的 OutputCoef 反向除。
+//   TokenQuota / TokenUsed / TokenRemaining 字段名仍叫 ETU 但 T3 死代码清除后
+//   = raw token (V29 系数管理已退役, raw 1:1 计费; ListCoefficients 已退役返空数组)。
 //
 // BucketClass:
 //   "COMMERCIAL" — 套餐授予的精确桶 (model_id 精确匹配)
@@ -796,7 +796,6 @@ type ModelBucket struct {
 	CallQuota          int     `json:"callQuota"`
 	CallUsed           int     `json:"callUsed"`
 	CallRemaining      int     `json:"callRemaining"`
-	CoefficientVersion int     `json:"coefficientVersion"`
 	AllowedModelsJSON  string  `json:"allowedModelsJson,omitempty"`
 }
 

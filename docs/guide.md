@@ -1664,14 +1664,14 @@ type ConsumeRecordPage struct { Records []ConsumeRecord; Total int64; Page, Page
 ### V29 Per-Model 桶 (v0.16.0+)
 
 ```go
-// 单桶视图 — TokenQuota/TokenUsed 单位均是 ETU (折算后), 不是原始 token
+// 单桶视图 — TokenQuota/TokenUsed 字段名仍叫 ETU 但 T3 死代码清除后 = raw token
+// (V29 系数管理已退役, raw 1:1 计费)
 type ModelBucket struct {
     BucketID, EntitlementID string
     ModelID                 string  // "*" = 通配 (GENERIC)
     BucketClass             string  // COMMERCIAL | GENERIC
     TokenQuota, TokenUsed, TokenRemaining int64
     CallQuota, CallUsed, CallRemaining    int
-    CoefficientVersion                    int
     AllowedModelsJSON                     string // 仅 GENERIC, JSON 数组
 }
 
