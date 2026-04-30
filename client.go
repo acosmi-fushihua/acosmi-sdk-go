@@ -57,7 +57,8 @@ type Client struct {
 	// L6 (v0.15): 重试策略. nil = 禁用 (v0.14.1 行为).
 	retryPolicy *RetryPolicy
 
-	// V29 系数缓存 (TTL 8s, ListCoefficients 内部用)
+	// 系数缓存 (TTL 8s, ListCoefficients 内部用); T3 死代码清除后 endpoint 返空数组,
+	// cache 永远缓存空数组, 字段保留是为了 API shape 不破坏既有调用方 (D2 决策)。
 	coefCacheMu   sync.Mutex
 	coefCacheData []ModelCoefficient
 	coefCacheAt   time.Time
@@ -1263,8 +1264,10 @@ func (c *Client) ListBuckets(ctx context.Context) ([]ModelBucket, error) {
 	return resp.Data, nil
 }
 
-// ListCoefficients 拉取模型系数表; 客户端可本地按 modelID 索引并按 OutputCoef 反向估算 raw token。
-// SDK 自带 8s TTL 内存缓存以减小调用风暴。
+// ListCoefficients 拉取模型系数表; T3 死代码清除后 (V29 ETU 概念退役, 改 raw 1:1 计费)
+// 服务端 endpoint 永远返回空数组 — 函数保留是为了 API shape 不破坏既有调用方 (D2 决策)。
+// SDK 自带 8s TTL 内存缓存; cache 也只缓存空数组, 实际意义不大但保留语义一致。
+// 调用方应迁移到直接用 raw token (input_tokens / output_tokens / cache_*_tokens) 替代 ETU 反算。
 func (c *Client) ListCoefficients(ctx context.Context) ([]ModelCoefficient, error) {
 	c.coefCacheMu.Lock()
 	if c.coefCacheData != nil && time.Since(c.coefCacheAt) < coefCacheTTL {
@@ -1285,7 +1288,8 @@ func (c *Client) ListCoefficients(ctx context.Context) ([]ModelCoefficient, erro
 	return resp.Data, nil
 }
 
-// InvalidateCoefficientCache 手动失效系数缓存 (admin 调价后建议立即调一次)。
+// InvalidateCoefficientCache 手动失效系数缓存; T3 死代码清除后 endpoint 永远返空数组,
+// 此函数实际无副作用价值, 保留是为 API shape 不破坏既有调用方 (D2 决策)。
 func (c *Client) InvalidateCoefficientCache() {
 	c.coefCacheMu.Lock()
 	c.coefCacheData = nil
