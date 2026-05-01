@@ -1,6 +1,6 @@
 # Acosmi Go SDK 开发手册
 
-> v0.19.0 | Go 1.22+ | MIT
+> v1.0.0 | Go 1.22+ | MIT
 
 ## 目录
 
@@ -2161,6 +2161,20 @@ make install    # → $GOPATH/bin
 ---
 
 ## 12. 版本记录
+
+### v1.0.0 (2026-05-01) — 联动稳定测试版基线 (Go SDK + TS SDK 同步里程碑)
+
+**性质**: 版本号晋升 (基于 v0.20.0 changelog 内容), 无新增代码改动 / 无新 breaking change。Go + TS git tree 即当前 main HEAD `53272b7 docs(sdk): T3 raw 1:1 同步`。
+
+**晋升说明**:
+- Go SDK 与 TS SDK 自此采用主版本联动 (1.x.0 同步) + patch 号独立的 semver 策略 — 见 `acosmi-sdk-ts/docs/开发与发布手册.md` §10
+- TS SDK 同步发布 `@acosmi/sdk-ts@1.0.0` (旧包名 `acosmi-sdk-ts` 重命名为 scoped 包, 旧名 1.0.0 已发占位, 后续 deprecate 单独窗口处理)
+- Go SDK npm wrapper `@acosmi/crabclaw-skill` 版本同步 0.19.0 → 1.0.0
+- 0.x 系列代表内部演进 (v0.20.0 为 0.x 末版, 仅 changelog 标识无 git tag); 1.0.0 起代表对外公开稳定测试版基线
+
+**本次发版无 SDK 代码改动** — v0.20.0 与 v1.0.0 git tree 内容一致, 仅版本号字符串 + npm 包名 + 文档基调更新 (v0.20.0 的 SDK breaking change 已是 0.x 末版改动, 在 1.0.0 中表现为已生效的稳定形态)。
+
+---
 
 ### v0.20.0 (2026-05-01) — T3 死代码清除 (V29 ETU 系数概念退役 + 免费区配额化)
 
