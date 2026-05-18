@@ -273,15 +273,21 @@ func (c *Client) loginInternal(ctx context.Context, appName string, scopes []str
 
 // Logout 吊销 token 并清除本地存储
 // [RC-4] meta==nil 时先 Discover 获取 revocation endpoint, 确保服务端 token 也被撤销
+// [RC15 2026-05-18] 修复 channel race: 必须 close 旧 tokenReady, 仅重新赋值会让阻塞中的 ensureToken
+// 永远等待已被 GC 引用孤悬的旧 chan, 直到 ctx 超时. 单锁内完成 close + 重置, 避免与 Login 竞争.
+// [RC16 2026-05-18] _ = RevokeToken 静默错误改为 stderr warn, 由 logger 兜底告警.
 func (c *Client) Logout(ctx context.Context) error {
 	c.mu.Lock()
 	tokens := c.tokens
 	meta := c.meta
+	// [RC15] 先关旧 chan, 让 ensureToken 阻塞 waiter 立即解除阻塞 → 看到 tokens=nil → "not authorized"
+	c.tokenOnce.Do(func() { close(c.tokenReady) })
+	// 然后重置为新的 chan + Once, 供下一次 Login 复用
 	c.tokens = nil
 	c.meta = nil
-	// v0.15.1: 重置等待信号 — 下次 Login 重新触发等待→唤醒流程
 	c.tokenReady = make(chan struct{})
 	c.tokenOnce = sync.Once{}
+	c.loginInFlight = false // 防 ensureToken 误判 inFlight=true 继续等空 chan
 	c.mu.Unlock()
 
 	if tokens != nil {
@@ -289,14 +295,19 @@ func (c *Client) Logout(ctx context.Context) error {
 			// Lazy discover for revocation endpoint
 			discovered, discErr := Discover(ctx, c.serverURL)
 			if discErr != nil {
-				fmt.Printf("[acosmi-sdk] warning: discover for revocation failed: %v\n", discErr)
+				fmt.Printf("[acosmi-sdk] warn auth.revoke.discover_failed: %v\n", discErr)
 			} else {
 				meta = discovered
 			}
 		}
 		if meta != nil {
-			_ = RevokeToken(ctx, meta, tokens.AccessToken)
-			_ = RevokeToken(ctx, meta, tokens.RefreshToken)
+			// [RC16] 撤销失败不再静默, warn 上报 (服务端可能临时 5xx, 客户端本地 store 仍会清, 不阻塞 Logout)
+			if err := RevokeToken(ctx, meta, tokens.AccessToken); err != nil {
+				fmt.Printf("[acosmi-sdk] warn auth.revoke.access_token_failed: %v\n", err)
+			}
+			if err := RevokeToken(ctx, meta, tokens.RefreshToken); err != nil {
+				fmt.Printf("[acosmi-sdk] warn auth.revoke.refresh_token_failed: %v\n", err)
+			}
 		}
 	}
 
@@ -694,6 +705,19 @@ func (c *Client) chatMessagesAnthropic(ctx context.Context, modelID string, req 
 	var raw json.RawMessage
 	if _, err := c.doJSONFull(ctx, http.MethodPost, "/managed-models/"+url.PathEscape(modelID)+"/anthropic", json.RawMessage(data), &raw); err != nil {
 		return nil, err
+	}
+
+	// [RC13 2026-05-18] 先嗅探 type=error: Anthropic raw 错误体 {"type":"error","error":{"type":"...","message":"..."}}
+	// 历史问题: 当上游 200 但 body 是 error 时, 直接走 AnthropicResponse 解析会得到空 struct, 静默成功
+	var typed struct {
+		Type  string `json:"type"`
+		Error struct {
+			Type    string `json:"type"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if json.Unmarshal(raw, &typed) == nil && typed.Type == "error" {
+		return nil, fmt.Errorf("anthropic error: %s (type=%s)", typed.Error.Message, typed.Error.Type)
 	}
 
 	// 尝试 APIResponse 包装: {"code":0,"message":"...","data":{...}}
