@@ -1,6 +1,6 @@
 # Acosmi Go SDK 开发手册
 
-> v0.19.0 | Go 1.22+ | MIT
+> v1.0.0 | Go 1.22+ | MIT
 
 ## 目录
 
@@ -911,15 +911,20 @@ if err != nil {
 > 这些 entitlement 的 `allowed_models` 设计上为空 (按 type 维度授权, 不限模型),
 > 同步只覆盖 `TOKEN_PACKAGE` 类型 (套餐购买快照需追平)。
 
-#### V29: Per-Model 桶计费 (v0.16.0+)
+#### V29 + T3: Per-Model 桶 (raw 1:1 计费)
 
 **背景**: 传统单池扣减不区分模型,Opus 与 DeepSeek 单价相差 200x 导致"白嫖额度刷高价模型"赔本。
-V29 把套餐拆成**按模型的独立桶**,每个桶用 ETU (Equivalent Token Unit) 折算计量。
+V29 把套餐拆成**按模型的独立桶**。
+
+**T3 死代码清除 (2026-05-01)**: V29 ETU (Equivalent Token Unit) 系数折算概念**已退役**。
+现行计费 = `raw_token` 直接 1:1 (`input_tokens + output_tokens`, cache 字段保留但不计费, V32 trade-off)。
+桶内字段名仍叫 `*ETU` (HTTP API JSON contract 不破坏既有调用方),但**值就是 raw token**。
 
 **核心概念**:
-- **ETU**: 桶内部记账单位,= raw_token × coef (input/output/cache_read 三系数加权)
+- **桶记账单位**: T3 后 = raw_token (原 V29 ETU 字段名保留,值=raw, 1:1)
 - **COMMERCIAL 桶**: 套餐购买的精确 modelId 桶,真金白银
-- **GENERIC 桶**: 注册赠送/邀请奖励/月度免费的通配桶 (model_id='*'),仅允许便宜模型白名单
+- **GENERIC 桶**: 注册赠送/邀请奖励/月度免费 + 免费区配额化通配桶 (model_id='*'),
+  允许模型由 admin `dist_free_zone_config` 配置 (T3 新, 替代 V29 yaml fallback)
 - **桶选择优先级**: COMMERCIAL > GENERIC,同 class 内精确匹配 > 通配兜底
 
 ```go
@@ -949,14 +954,10 @@ for _, b := range buckets {
     fmt.Printf("  [%s] %s: %d/%d ETU\n", b.BucketClass, label, b.TokenUsed, b.TokenQuota)
 }
 
-// 3. 拉系数表 (UI 反向估算 raw token 用); SDK 内置 8s TTL 缓存避免风暴
+// 3. (Deprecated, T3 后返空) 系数表 — V29 概念已退役, raw 1:1 计费, 调用方应直接用 raw token
+//    endpoint shape 保留是为不破坏既有调用方, 永远返空数组 (D2 决策)
 coefs, _ := client.ListCoefficients(ctx)
-for _, c := range coefs {
-    fmt.Printf("  %s: in=%.4f out=%.4f cacheR=%.4f v%d\n",
-        c.ModelID, c.InputCoef, c.OutputCoef, c.CacheReadCoef, c.Version)
-}
-// admin 改系数后立即失效缓存
-client.InvalidateCoefficientCache()
+_ = coefs // T3 后 always []; admin 已无系数管理页 (V34 DROP TABLE model_cost_coefficients)
 ```
 
 **Chat 响应自动回填模型剩余** (Header `X-Token-Remaining-Model` / `X-Token-Remaining-Model-ETU`):
@@ -977,15 +978,17 @@ if resp.ModelTokenRemaining >= 0 {
 | 模型选择器显示余量 badge | `GetByModel` | **无 SDK 缓存**, 调用方自行节流 (建议 ≥ 5s/模型) |
 | 个人中心多桶展示 | `ListBuckets` | **无 SDK 缓存**, 应用层每次刷新主动调 |
 | Chat 响应后实时刷新当前模型 | `resp.ModelTokenRemaining` (响应头自动填充) | 0 额外 RTT |
-| Pricing 页显示 ETU 系数表 | `ListCoefficients` | **8s TTL 内置缓存** (`InvalidateCoefficientCache()` 手动失效) |
+| ~~Pricing 页显示 ETU 系数表~~ | ~~`ListCoefficients`~~ | **T3 退役** (返空数组, V29 系数概念已退役 raw 1:1 计费) |
 
-> **缓存边界提醒**: 仅 `ListCoefficients` 在 SDK 层带 8s TTL (实证: `client.go` `coefCacheTTL = 8 * time.Second`)。
-> 其余三个 API 每次都走 HTTP, 调用方需自行控制频率 — 否则 chat 高频场景会拖慢 RTT。
+> **T3 后缓存提醒**: `ListCoefficients` 仍保 8s TTL cache 但 endpoint 永远返空, cache 实际无价值。
+> `GetByModel` / `ListBuckets` 每次走 HTTP, 调用方需自行控制频率 — 否则 chat 高频场景会拖慢 RTT。
 
 **注意事项**:
-- ETU 与 raw token 不是 1:1: 用 `OutputCoef` 反向除可估算 raw 等值,但精确量在 hold/settle 时才确定
+- T3 后 ETU 字段值 = raw token (1:1); 字段名留是为 JSON contract 不破坏既有调用方
 - GENERIC 桶模型受 `AllowedModelsJSON` 白名单限制,调白名单外的模型会 403 `MODEL_NOT_ALLOWED`
-- 灰度期老用户 entitlement 可能无桶 (`ListBuckets` 返回空), 此时仍走 legacy 单池路径,不影响 Chat 调用
+  (免费区白名单由 admin `dist_free_zone_config` 配置, T3 新)
+- 灰度期老用户 entitlement 可能无桶 (`ListBuckets` 返回空), 此时仍走 legacy fail-open 路径
+  (`failOpenLegacy=true`); T3 灰度通过后切 `false` 强制走多桶
 
 #### V0.19: 钱包总览 — 免费/付费切分 (v0.19.0+)
 
@@ -1664,14 +1667,14 @@ type ConsumeRecordPage struct { Records []ConsumeRecord; Total int64; Page, Page
 ### V29 Per-Model 桶 (v0.16.0+)
 
 ```go
-// 单桶视图 — TokenQuota/TokenUsed 单位均是 ETU (折算后), 不是原始 token
+// 单桶视图 — TokenQuota/TokenUsed 字段名仍叫 ETU 但 T3 死代码清除后 = raw token
+// (V29 系数管理已退役, raw 1:1 计费)
 type ModelBucket struct {
     BucketID, EntitlementID string
     ModelID                 string  // "*" = 通配 (GENERIC)
     BucketClass             string  // COMMERCIAL | GENERIC
     TokenQuota, TokenUsed, TokenRemaining int64
     CallQuota, CallUsed, CallRemaining    int
-    CoefficientVersion                    int
     AllowedModelsJSON                     string // 仅 GENERIC, JSON 数组
 }
 
@@ -2159,6 +2162,60 @@ make install    # → $GOPATH/bin
 
 ## 12. 版本记录
 
+### v1.0.0 (2026-05-01) — 联动稳定测试版基线 (Go SDK + TS SDK 同步里程碑)
+
+**性质**: 版本号晋升 (基于 v0.20.0 changelog 内容), 无新增代码改动 / 无新 breaking change。Go + TS git tree 即当前 main HEAD `53272b7 docs(sdk): T3 raw 1:1 同步`。
+
+**晋升说明**:
+- Go SDK 与 TS SDK 自此采用主版本联动 (1.x.0 同步) + patch 号独立的 semver 策略 — 见 `acosmi-sdk-ts/docs/开发与发布手册.md` §10
+- TS SDK 同步发布 `@acosmi/sdk-ts@1.0.0` (旧包名 `acosmi-sdk-ts` 重命名为 scoped 包, 旧名 1.0.0 已发占位, 后续 deprecate 单独窗口处理)
+- Go SDK npm wrapper `@acosmi/crabclaw-skill` 版本同步 0.19.0 → 1.0.0
+- 0.x 系列代表内部演进 (v0.20.0 为 0.x 末版, 仅 changelog 标识无 git tag); 1.0.0 起代表对外公开稳定测试版基线
+
+**本次发版无 SDK 代码改动** — v0.20.0 与 v1.0.0 git tree 内容一致, 仅版本号字符串 + npm 包名 + 文档基调更新 (v0.20.0 的 SDK breaking change 已是 0.x 末版改动, 在 1.0.0 中表现为已生效的稳定形态)。
+
+---
+
+### v0.20.0 (2026-05-01) — T3 死代码清除 (V29 ETU 系数概念退役 + 免费区配额化)
+
+**背景**: V29 per-model 桶机制上线后, 7 model 在生产 `model_cost_coefficients` 表全 missing 走
+`fail-open NULL coef` 等价 raw 1:1 计费 — 系数表实际未发挥作用. T3 死代码清除正式退役 V29 ETU
+(Equivalent Token Unit) 系数折算概念, 全栈 (Java tk-dist + Go nexus + SDK) 改 raw 1:1。
+
+**SDK 端 breaking change (D4 决策 "纯净不留兼容")**:
+- **删字段** `ModelBucket.CoefficientVersion int` (types.go:799) — 老调用方反序列化时该字段
+  转为 lenient ignore (Go json 默认行为), JSON 字面量多余字段不会破坏。
+- 老 v0.16.0~v0.19.0 调用方读取该字段会失败编译 → 升级 SDK 同步删调用方读字段。
+
+**SDK 端保留 (D2 决策 "endpoint shape 不破坏既有调用方")**:
+- `ModelCoefficient` struct + 4 coef 字段 (`InputCoef` / `OutputCoef` / `CacheReadCoef` / `CacheCreationCoef`):
+  保留, 服务端 endpoint 永远返空数组, struct 字段是零值 fail-soft。
+- `ListCoefficients(ctx)` / `InvalidateCoefficientCache()`: 保留, 永远空数组 + 8s TTL cache 也保留。
+- 全部 `*Etu` / `*ETU` 字段名 (105 个): 保留, **值 = raw token (1:1)**, 字段名 = HTTP JSON contract 不变。
+
+**SDK 文档同步更新**:
+- §11 "V29 + T3: Per-Model 桶 (raw 1:1 计费)" 章节: 描述 raw 1:1 + 免费区配额化白名单 (admin
+  `dist_free_zone_config` 配置), 替代 V29 yaml fallback。
+- `ListCoefficients` 例子加 deprecated 标注 (T3 后返空)。
+- `BucketInfo` 字段单位说明: `*Etu` 名 → 值 = raw token。
+
+**配套上游变化 (用户感知零差异除非读 CoefficientVersion 字段)**:
+- tk-dist V34 `DROP TABLE model_cost_coefficients` (R2 不可逆点)。
+- tk-dist `EntitlementService` 改 `long etu = max(1L, input + output)` (cache 不计费, V32 trade-off)。
+- tk-dist Java DO `consume_records.coefficient_version` 列保留 NULL 作审计回溯 (D1 策略 I)。
+- nexus-v4 `managed_model_usage_logs.model_id` 列宽 varchar(36)→100 (H3 修复后存业务字符串而非 UUID)。
+- 免费区配额化: 营销 admin 后台 `dist_free_zone_config` 配 ratio JSON, 替代 yaml `GenericBucketDefaults`。
+
+**部署 sequence**:
+1. 先发 SDK v0.20.0 (breaking 字段删除, 与上游同步发版避免老 SDK 解析失败)
+2. tk-dist V30+V31+V32+V33+V34 SQL apply
+3. tk-dist + nexus-v4 jar/binary 重 build + 部署
+4. 灰度 3 天 → 切 `failOpenLegacy=false` 让 V29 多桶机制真正接管。
+
+**紧急回滚 (灰度期)**:
+- yaml `failOpenLegacy=true` → 立即恢复旧 fail-open 行为
+- V34 已 DROP, **不可恢复 model_cost_coefficients 表** (从 backup `tk_dist-pre-t3-{date}.sql.gz` 恢复)
+
 ### v0.19.0 (2026-04-29) — 钱包总览 + 免费/付费切分 (V30 后续增量)
 
 **背景**: V30 一二轮把 ListModels 接通了 entitlement, 但 SDK 用户实际 UI 渲染时发现痛点:
@@ -2252,7 +2309,9 @@ fmt.Printf("免费: %d ETU (%v 到期) | 付费: %d ETU (%v 到期)\n",
       Expired       bool       `json:"expired,omitempty"`       // 全部桶都过期
   }
   ```
-  全部字段单位为 **ETU** (Equivalent Token Unit, V29 系数折算后), 不是 raw token. 与 `ListBuckets` / `GetByModel` 单位一致。
+  全部字段名为 `*Etu` (V29 命名留作 JSON contract). T3 死代码清除后**值 = raw token (1:1)** —
+  V29 ETU 系数折算概念已退役 (`ListCoefficients` 返空数组, V34 DROP TABLE model_cost_coefficients).
+  与 `ListBuckets` / `GetByModel` 单位一致。
 
 - **`ManagedModel` 新增字段**: `BucketInfo *BucketInfo` (omitempty + 指针, admin / fallback 路径为 nil)
 

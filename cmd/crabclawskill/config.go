@@ -21,7 +21,8 @@ func defaultConfig() CLIConfig {
 	}
 	return CLIConfig{
 		ServerURL: "https://acosmi.com",
-		SkillDir:  filepath.Join(home, ".acosmi", "skills"),
+		// CrabClaw / CrabCode 默认 skills 目录,安装后被本地客户端自动加载
+		SkillDir: filepath.Join(home, ".crabclaw", "skills"),
 	}
 }
 

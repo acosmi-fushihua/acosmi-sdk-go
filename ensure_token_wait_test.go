@@ -276,3 +276,86 @@ func TestEnsureTokenWait_RaceWithLogout(t *testing.T) {
 		t.Fatal("ensureToken hung")
 	}
 }
+
+// [RC15 2026-05-18] Logout 必须 close 旧 tokenReady 让阻塞的 ensureToken 解除阻塞
+// 修复前: c.tokenReady = make(...) 重赋值不 close, 阻塞 goroutine 持有旧 chan 引用永远不被唤醒.
+func TestLogout_UnblocksConcurrentEnsureToken(t *testing.T) {
+    c, err := NewClient(Config{ServerURL: "http://127.0.0.1:0", Store: &memStore{}})
+    if err != nil {
+        t.Fatalf("NewClient: %v", err)
+    }
+
+    // 模拟 Login 进行中
+    c.mu.Lock()
+    c.loginInFlight = true
+    c.mu.Unlock()
+
+    done := make(chan error, 1)
+    go func() {
+        ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+        defer cancel()
+        _, err := c.ensureToken(ctx)
+        done <- err
+    }()
+
+    // 让等待方先进入 select <-ready
+    time.Sleep(30 * time.Millisecond)
+
+    // Logout: 必须 close 旧 chan, 等待方应立即收到信号
+    if err := c.Logout(context.Background()); err != nil {
+        t.Fatalf("Logout: %v", err)
+    }
+
+    select {
+    case err := <-done:
+        if err == nil || !strings.Contains(err.Error(), "call Login() first") {
+            t.Fatalf("expected 'call Login() first' after Logout, got: %v", err)
+        }
+    case <-time.After(500 * time.Millisecond):
+        t.Fatal("ensureToken still blocked after Logout — RC15 channel race regression")
+    }
+
+    // Logout 后 loginInFlight 必须 reset, 新 ensureToken 必须 fail-fast (没等)
+    start := time.Now()
+    _, err = c.ensureToken(context.Background())
+    elapsed := time.Since(start)
+    if err == nil || elapsed > 50*time.Millisecond {
+        t.Fatalf("post-Logout ensureToken should fail-fast, got err=%v elapsed=%v", err, elapsed)
+    }
+}
+
+// [RC15] 压测: 50 轮 Login(模拟) + Logout 并发, -race 无 deadlock / no data race
+func TestLogout_RaceStress(t *testing.T) {
+    if testing.Short() {
+        t.Skip("race stress")
+    }
+    c, err := NewClient(Config{ServerURL: "http://127.0.0.1:0", Store: &memStore{}})
+    if err != nil {
+        t.Fatalf("NewClient: %v", err)
+    }
+    _ = errors.New // 防 unused import 自动剔除
+    var hits atomic.Int32
+    var wg sync.WaitGroup
+    for i := 0; i < 50; i++ {
+        wg.Add(2)
+        go func() {
+            defer wg.Done()
+            // 模拟 Login 完成: 直接 set tokens + close ready
+            c.mu.Lock()
+            c.loginInFlight = true
+            c.tokens = &TokenSet{AccessToken: "x", ExpiresAt: time.Now().Add(time.Hour)}
+            c.tokenOnce.Do(func() { close(c.tokenReady) })
+            c.loginInFlight = false
+            c.mu.Unlock()
+            if _, err := c.ensureToken(context.Background()); err == nil {
+                hits.Add(1)
+            }
+        }()
+        go func() {
+            defer wg.Done()
+            _ = c.Logout(context.Background())
+        }()
+    }
+    wg.Wait()
+    // 不断言 hits 数, 仅断言无 deadlock / no race (上层 go test -race 会触发 race 报错)
+}
