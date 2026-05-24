@@ -28,6 +28,8 @@
 - [10. 构建与发布](#10-构建与发布)
 - [11. 常见问题](#11-常见问题)
 - [12. 版本记录](#12-版本记录)
+- [13. 业务侧终端用户 id (EndUserID)](#13-业务侧终端用户-id-enduserid)
+- [14. 请求保活机制处理](#14-请求保活机制处理)
 
 ---
 
@@ -2671,6 +2673,20 @@ context.Canceled   → false (用户主动 abort)
 - `StreamEvent` 新增 block 元数据：`BlockIndex` / `BlockType` / `Ephemeral`。
 - 相关说明见 §8 “请求前防御与 Ephemeral 历史剥离”。
 
+### v1.6.0 (2026-05-24)
+
+- 新增 `ChatRequest.EndUserID` 字段 (TS 镜像 `endUserId`)。业务侧终端用户 id, 跨 provider 通用语义,
+  不绑死 DeepSeek。SDK 序列化规则:
+  - OpenAI wire (`/chat` 端点 → DeepSeek-OpenAI / DashScope / Zhipu / VolcEngine 等):
+    顶层 `body["user_id"]`, 与上游 OpenAI extra_body 直透一致。
+  - Anthropic wire (`/anthropic` 端点): 合并到 `body["metadata"]["user_id"]`; caller `Metadata` 显式键优先, EndUserID 不覆盖。
+- 网关 sanitizer 在 step 4.4 做最终校验 + 派生 + 注入; caller 显式覆盖需 `scope=endusr.set`,
+  无授权时 EndUserID 视作非授权来源被丢弃, 上游收到的是网关派生值 (HMAC-SHA256 32 字符)。
+- 约束: 长度 ≤ 512, 字符集 `[a-zA-Z0-9_-]+`, **禁止包含用户隐私信息** (邮箱/手机/真名等).
+- `ValidateEndUserID(s string) error` 公开 helper, caller 赋值前可自校验。
+- HTTP 客户端 per-request timeout 5min → **11min**, 覆盖 DeepSeek 上游"开始推理前最大 10min 保活"窗口。
+- SSE 解析器显式跳过 `:` 注释行 (`": keep-alive"`), 防回归。
+
 ### v0.10.0 (2026-04-22) ⚠️ 破坏性
 
 - Adapter 选择从“硬编码 provider”切换为“优先读取 `PreferredFormat` / `SupportedFormats`”。
@@ -2706,6 +2722,110 @@ context.Canceled   → false (用户主动 abort)
 - `v0.3.x`：模型能力矩阵、搜索来源、`ChatStreamWithUsage` 四通道返回、开发手册补全。
 - `v0.2.x`：余额 Header、结算事件、扩展字段、模型缓存、`LoginWithHandler`。
 - `v0.1.0`：初始发布，合并 desktop-sdk-go 与 jineng-sdk-go。
+
+---
+
+## 13. 业务侧终端用户 id (EndUserID)
+
+> v1.6.0 起新增。跨 provider 通用语义, **不绑死 DeepSeek**, 任何兼容此协议的上游均可受益。
+
+### 13.1 语义
+
+`ChatRequest.EndUserID` 表示**业务侧终端用户**的稳定标识 — 你的应用里"谁在调 SDK"。SDK 序列化为请求体顶层 `user_id` (OpenAI wire) 或 `metadata.user_id` (Anthropic wire), 由网关侧校验并派生后送达上游, 命中上游的三项隔离能力:
+
+- **内容安全隔离**: 不同业务用户的违规行为不混算
+- **KV-cache 隔离**: 用户隐私不会因 cache 跨用户串接
+- **调度隔离**: 上游可按业务用户做更细粒度的流量调度
+
+### 13.2 使用方式
+
+```go
+resp, err := client.Chat(ctx, modelID, acosmi.ChatRequest{
+    Messages:  []acosmi.ChatMessage{{Role: "user", Content: "hello"}},
+    EndUserID: "user-abc-123",  // 业务侧用户稳定 id, 见下"约束"
+})
+```
+
+流式同理:
+
+```go
+events, errs := client.ChatStream(ctx, modelID, acosmi.ChatRequest{
+    Messages:  msgs,
+    EndUserID: "user-abc-123",
+})
+```
+
+### 13.3 约束 (上游官方文档对齐)
+
+| 项 | 限制 |
+|---|---|
+| 字符集 | `[a-zA-Z0-9_\-]+` (字母数字下划线连字符) |
+| 长度 | ≤ 512 字节 |
+| **禁止包含** | 邮箱 / 手机号 / 真名 / 任何 PII |
+
+赋值前可调 helper 自校验, 避免被网关静默丢弃:
+
+```go
+if err := acosmi.ValidateEndUserID(uid); err != nil {
+    // 处理: PII / 长度 / 字符集不合规
+    return err
+}
+req.EndUserID = uid
+```
+
+### 13.4 优先级与覆盖
+
+| 来源 | 优先级 | 网关处理 |
+|---|---|---|
+| `ChatRequest.EndUserID` 显式给值 | 最高 | 仅 caller 拥有 `scope=endusr.set` 才采信; 否则丢弃并静默, 改用网关派生 |
+| `ChatRequest.Metadata["user_id"]` (Anthropic wire) | 中 | 与 EndUserID 共存时 Metadata 显式键优先 (SDK 层不覆盖 caller) |
+| `ChatRequest.ExtraBody["user_id"]` (OpenAI wire) | 低 | 被 EndUserID 显式值覆盖 (单一真相, 避免双写歧义) |
+| 不设 | 默认 | 网关从认证身份 HMAC-SHA256 派生 32 字符稳定 id 注入 |
+
+### 13.5 隐私与脱敏建议
+
+**DO**:
+- 用业务侧 ULID / UUID / 自增 id 哈希 后传入
+- 同一业务用户每次调用传相同值 (利于上游 KV-cache 命中)
+
+**DON'T**:
+- 直接传邮箱 / 手机号 / 真实姓名
+- 用 random session id (每次都变, 上游 cache / 调度策略无法对齐)
+- 跨业务环境复用同一 id (生产 / 预发 应有不同的 id 空间)
+
+---
+
+## 14. 请求保活机制处理
+
+> v1.6.0 起新增。SDK 已内置正确处理上游 (DeepSeek 等) 的"开始推理前最长保活窗口"。
+
+### 14.1 上游协议
+
+部分上游 (如 DeepSeek) 在收到请求后, 推理开始前可能持续保活长达 **10 分钟**, 期间:
+
+- **非流式**: 持续返回 HTTP 空行 (body leading whitespace)
+- **流式 (SSE)**: 持续返回 SSE 注释行 `: keep-alive`
+
+10 分钟仍未推理则上游会主动关闭连接。
+
+### 14.2 SDK 内置处理
+
+| 维度 | 行为 |
+|---|---|
+| Per-request 超时 | `chatRequestTimeout = 11 * time.Minute` 覆盖上游 10min + 1min 余量 |
+| SSE 注释行 | `isSSECommentLine(line)` helper 在 3 个流式解析循环显式跳过, 防回归 |
+| 非流式空行 | 标准 `json.Unmarshal` 原生容忍 leading whitespace, 无自定义 split-then-parse |
+
+调用方**无需做任何额外处理**, 直接走 `Chat / ChatStream / ChatMessages / ChatMessagesStream` 即可。
+
+### 14.3 自行解析 HTTP 响应时的注意事项
+
+仅当你不用 SDK 而自己解析 HTTP body / SSE 流时, 需要:
+
+- **流式**: `if strings.HasPrefix(line, ":") { continue }` 跳过注释行, 不当作 data 行解析
+- **非流式**: 用标准 JSON 库, 别用按行 split-then-parse 的自定义实现 (空行会让你的状态机错乱)
+
+SDK 内部已暴露 `acosmi.isSSECommentLine` (包内不导出, 仅作示意), 自行实现照搬即可。
 
 ---
 

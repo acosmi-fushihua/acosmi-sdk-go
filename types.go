@@ -334,6 +334,14 @@ type ChatRequest struct {
 	// ParallelToolCalls 对应 OpenAI `parallel_tool_calls` 顶层字段,
 	// 控制模型能否在单次响应中发多个 tool_call。nil = 不设置 (沿用上游默认 true)。
 	ParallelToolCalls *bool `json:"-"`
+
+	// v1.6.0: 业务侧终端用户 id, 跨 provider 通用语义 (不绑死 DeepSeek)。
+	// 仅当 caller 拥有 scope=endusr.set 时网关采信; 否则被网关 sanitizer 校验/覆盖。
+	// 约束: 长度 ≤ 512, 字符集 [a-zA-Z0-9_\-]+, 禁止包含用户隐私信息。
+	// 二选一:
+	//   OpenAI wire → 序列化为顶层 body["user_id"]
+	//   Anthropic wire → 合并到 body["metadata"]["user_id"]; caller Metadata 显式键优先, 不被覆盖
+	EndUserID string `json:"-"`
 }
 
 // ---------- Chat 扩展类型 ----------

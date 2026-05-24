@@ -53,8 +53,21 @@ func (a *AnthropicAdapter) BuildRequestBody(caps ModelCapabilities, req *ChatReq
 		}
 	}
 
-	if req.Metadata != nil {
-		body["metadata"] = req.Metadata
+	// ── Metadata + v1.6.0 EndUserID 合并 ──
+	// caller 显式 Metadata 键 (含 user_id) 永远优先, EndUserID 仅在 metadata 无 user_id 键时填入。
+	// 不污染 caller 原始 map: 通过浅拷贝构造新 map[string]any (Anthropic wire 接受 map[string]any),
+	// 同时保留所有 caller 原有键, 避免被上游 strip。
+	if req.Metadata != nil || req.EndUserID != "" {
+		meta := make(map[string]any, len(req.Metadata)+1)
+		for k, v := range req.Metadata {
+			meta[k] = v
+		}
+		if req.EndUserID != "" {
+			if _, exists := meta["user_id"]; !exists {
+				meta["user_id"] = req.EndUserID
+			}
+		}
+		body["metadata"] = meta
 	}
 
 	// ── 合入 Tools + ServerTools ──

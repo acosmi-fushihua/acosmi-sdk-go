@@ -39,10 +39,11 @@ func main() {
     balance, _ := client.GetBalance(ctx)
     fmt.Printf("Token 剩余: %d\n", balance.TotalTokenRemaining)
 
-    // 流式聊天
+    // 流式聊天 (v1.6.0+ 推荐传 EndUserID 启用上游用户隔离 / KV-cache / 调度三项策略)
     models, _ := client.ListModels(ctx)
     events, errs := client.ChatStream(ctx, models[0].ID, acosmi.ChatRequest{
-        Messages: []acosmi.ChatMessage{{Role: "user", Content: "你好"}},
+        Messages:  []acosmi.ChatMessage{{Role: "user", Content: "你好"}},
+        EndUserID: "user-abc-123", // 业务侧稳定 id, 非 PII; 不传时网关从认证身份自动派生
     })
     for e := range events {
         fmt.Print(e.Data)
@@ -52,6 +53,9 @@ func main() {
     }
 }
 ```
+
+> **v1.6.0 新特性**: `EndUserID` 字段 + 自动 SSE 保活解析 + 11min per-request 超时 (覆盖
+> DeepSeek 等上游 "开始推理前最长 10min 保活" 窗口)。详见 [开发手册 §13 §14](docs/guide.md)。
 
 ### 作为 CLI 工具使用
 
