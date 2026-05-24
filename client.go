@@ -21,9 +21,15 @@ import (
 
 // 安全限制常量
 const (
-	maxDownloadSize   = 50 << 20 // 50MB — 技能 ZIP 包最大下载体积
-	maxErrorBodySize  = 1 << 20  // 1MB — 错误响应体最大读取量
-	maxSSELineSize    = 1 << 20  // 1MB — SSE 单行最大长度 (大 JSON chunk)
+	maxDownloadSize  = 50 << 20 // 50MB — 技能 ZIP 包最大下载体积
+	maxErrorBodySize = 1 << 20  // 1MB — 错误响应体最大读取量
+	maxSSELineSize   = 1 << 20  // 1MB — SSE 单行最大长度 (大 JSON chunk)
+
+	// v1.6.0: Chat / ChatMessages / ChatStream / ChatMessagesStream 的 per-request 超时上限。
+	// 上游 (如 DeepSeek) 在开始推理前可能持续保活长达 10 分钟; SDK 必须容纳
+	// "首字节前等待 + 推理 + 流式传输" 全程, 否则会在等待阶段误超时切断。
+	// 单值覆盖, 不区分首字节 vs 总耗时 (per-request context 是总耗时上限)。
+	chatRequestTimeout = 11 * time.Minute
 )
 
 // Client Acosmi nexus-v4 统一 API 客户端
@@ -609,10 +615,11 @@ func (c *Client) buildChatRequest(ctx context.Context, modelID string, req *Chat
 // v0.5.0: 根据 provider 自动路由到 /anthropic 或 /chat 端点
 func (c *Client) Chat(ctx context.Context, modelID string, req ChatRequest) (*ChatResponse, error) {
 	req.Stream = false
-	// Chat 请求可能 30-120s+，使用 5 分钟超时而非默认 30s
+	// Chat 请求可能 30-120s+; v1.6.0 起调整为 chatRequestTimeout (11min),
+	// 容纳 DeepSeek 等上游"首字节前最长 10min 保活"窗口。
 	if _, hasDeadline := ctx.Deadline(); !hasDeadline {
 		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, 5*time.Minute)
+		ctx, cancel = context.WithTimeout(ctx, chatRequestTimeout)
 		defer cancel()
 	}
 
@@ -687,7 +694,7 @@ func (c *Client) chatMessagesAnthropic(ctx context.Context, modelID string, req 
 	req.Stream = false
 	if _, hasDeadline := ctx.Deadline(); !hasDeadline {
 		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, 5*time.Minute)
+		ctx, cancel = context.WithTimeout(ctx, chatRequestTimeout)
 		defer cancel()
 	}
 
@@ -752,7 +759,7 @@ func (c *Client) chatMessagesOpenAI(ctx context.Context, modelID string, req Cha
 	req.Stream = false
 	if _, hasDeadline := ctx.Deadline(); !hasDeadline {
 		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, 5*time.Minute)
+		ctx, cancel = context.WithTimeout(ctx, chatRequestTimeout)
 		defer cancel()
 	}
 
@@ -860,6 +867,11 @@ func (c *Client) chatMessagesStreamInternal(ctx context.Context, modelID string,
 		var currentEvent string
 		for scanner.Scan() {
 			line := scanner.Text()
+			// v1.6.0: 显式跳过 SSE 注释行 (": comment" 形如 ": keep-alive")。
+			// 历史上"未匹配 event:/data: 即静默跳过"已经兼容, 这里显式化避免未来回归。
+			if isSSECommentLine(line) {
+				continue
+			}
 			if after, ok := strings.CutPrefix(line, "event:"); ok {
 				currentEvent = strings.TrimSpace(after)
 				_ = currentEvent // OpenAI SSE 通常没有 event: 行
@@ -884,6 +896,10 @@ func (c *Client) chatMessagesStreamInternal(ctx context.Context, modelID string,
 		blockTypeMap := make(map[int]blockMeta)
 		for scanner.Scan() {
 			line := scanner.Text()
+			// v1.6.0: 显式跳过 SSE 注释行
+			if isSSECommentLine(line) {
+				continue
+			}
 			if after, ok := strings.CutPrefix(line, "event:"); ok {
 				currentEvent = strings.TrimSpace(after)
 			} else if after, ok := strings.CutPrefix(line, "data:"); ok {
@@ -993,6 +1009,10 @@ func (c *Client) chatStreamInternal(ctx context.Context, modelID string, req Cha
 	var currentEvent string
 	for scanner.Scan() {
 		line := scanner.Text()
+		// v1.6.0: 显式跳过 SSE 注释行
+		if isSSECommentLine(line) {
+			continue
+		}
 		if after, ok := strings.CutPrefix(line, "event:"); ok {
 			currentEvent = strings.TrimSpace(after)
 		} else if after, ok := strings.CutPrefix(line, "data:"); ok {

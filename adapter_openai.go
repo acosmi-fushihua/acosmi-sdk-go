@@ -153,6 +153,14 @@ func (a *OpenAIAdapter) BuildRequestBody(caps ModelCapabilities, req *ChatReques
 		body[k] = v
 	}
 
+	// ── v1.6.0: EndUserID → 顶层 body["user_id"] (OpenAI wire 形态) ──
+	// 优先级最高: 在 ExtraBody 之后写入, 即便 caller 通过 ExtraBody["user_id"] 自填,
+	// 显式 EndUserID 仍胜出 (单一真相, 避免双写歧义)。
+	// 网关 sanitizer 仍会做最终校验与权限决断, 此处仅负责字段位置正确。
+	if req.EndUserID != "" {
+		body["user_id"] = req.EndUserID
+	}
+
 	// ── 流式选项 ──
 	if req.Stream {
 		body["stream_options"] = map[string]any{
