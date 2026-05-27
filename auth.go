@@ -21,12 +21,30 @@ import (
 // 根因修复 #1: http.DefaultClient 无超时, auth 调用可能永久阻塞
 var authHTTPClient = &http.Client{Timeout: 30 * time.Second}
 
+type TokenEndpointError struct {
+	StatusCode       int
+	OAuthError       string
+	ErrorDescription string
+}
+
+func (e *TokenEndpointError) Error() string {
+	message := e.ErrorDescription
+	if message == "" {
+		message = e.OAuthError
+	}
+	if message == "" {
+		return fmt.Sprintf("token: HTTP %d", e.StatusCode)
+	}
+	return fmt.Sprintf("token: HTTP %d: %s", e.StatusCode, message)
+}
+
 // ---------- Discovery ----------
 
 // Discover 从 well-known 端点获取 Desktop OAuth 服务元数据。
 // serverURL 可能含路径 (如 "https://acosmi.ai/api/v4")，
 // well-known 端点按 RFC 8414 必须在 origin 根路径:
-//   https://acosmi.ai/.well-known/oauth-authorization-server/desktop
+//
+//	https://acosmi.ai/.well-known/oauth-authorization-server/desktop
 func Discover(ctx context.Context, serverURL string) (*ServerMetadata, error) {
 	parsed, err := url.Parse(strings.TrimRight(serverURL, "/"))
 	if err != nil {
@@ -426,9 +444,16 @@ func postToken(ctx context.Context, endpoint string, data url.Values) (*TokenRes
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		var errBody map[string]string
+		var errBody struct {
+			Error            string `json:"error"`
+			ErrorDescription string `json:"error_description"`
+		}
 		json.NewDecoder(resp.Body).Decode(&errBody)
-		return nil, fmt.Errorf("token: HTTP %d: %s", resp.StatusCode, errBody["error_description"])
+		return nil, &TokenEndpointError{
+			StatusCode:       resp.StatusCode,
+			OAuthError:       errBody.Error,
+			ErrorDescription: errBody.ErrorDescription,
+		}
 	}
 
 	var tokenResp TokenResponse

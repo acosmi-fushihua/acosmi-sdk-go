@@ -389,6 +389,12 @@ func (c *Client) ensureToken(ctx context.Context) (string, error) {
 
 	tokenResp, err := RefreshToken(ctx, c.meta, c.tokens.ClientID, c.tokens.RefreshToken)
 	if err != nil {
+		if isInvalidGrantError(err) {
+			if clearErr := c.clearInvalidRefreshTokenLocked(); clearErr != nil {
+				fmt.Printf("[acosmi-sdk] warning: clear invalid token failed: %v\n", clearErr)
+			}
+			return "", fmt.Errorf("refresh token invalid; local tokens cleared: %w", err)
+		}
 		return "", fmt.Errorf("refresh token: %w", err)
 	}
 
@@ -426,15 +432,15 @@ func (c *Client) ListModels(ctx context.Context) ([]ManagedModel, error) {
 type FilterStatus string
 
 const (
-	FilterStatusOK                   FilterStatus = "ok"                                  // 正常按用户 entitlement 过滤
-	FilterStatusAdminBypass          FilterStatus = "admin-bypass"                        // admin 路径 (V30 二轮后仅 ListAdmin 端点能命中)
-	FilterStatusInternalBypass       FilterStatus = "internal-bypass"                     // X-Internal-Bypass header 命中 (CI/bot)
-	FilterStatusDisabledByFlag       FilterStatus = "disabled-by-flag"                    // ENTITLEMENT_LIST_FILTER_ENABLED=false 灰度回滚
-	FilterStatusFallbackTkdistError  FilterStatus = "fallback-tkdist-error"               // tk-dist RPC 失败 fail-OPEN, UI 应 toast 提示
-	FilterStatusFallbackTkdistSkew   FilterStatus = "fallback-tkdist-deployment-skew"     // tk-dist 返 404 (V30 二轮 B-P1-D), 部署版本不一致, SRE 需查 tk-dist
-	FilterStatusFallbackNoBuckets    FilterStatus = "fallback-no-buckets"                 // V9 老用户无桶 fallback
-	FilterStatusFallbackMissingUser  FilterStatus = "fallback-missing-userid"             // 防御性, 应永远不出现
-	FilterStatusUnknown              FilterStatus = ""                                    // 未知/缺失 — 老 nexus / 非 V30 端点
+	FilterStatusOK                  FilterStatus = "ok"                              // 正常按用户 entitlement 过滤
+	FilterStatusAdminBypass         FilterStatus = "admin-bypass"                    // admin 路径 (V30 二轮后仅 ListAdmin 端点能命中)
+	FilterStatusInternalBypass      FilterStatus = "internal-bypass"                 // X-Internal-Bypass header 命中 (CI/bot)
+	FilterStatusDisabledByFlag      FilterStatus = "disabled-by-flag"                // ENTITLEMENT_LIST_FILTER_ENABLED=false 灰度回滚
+	FilterStatusFallbackTkdistError FilterStatus = "fallback-tkdist-error"           // tk-dist RPC 失败 fail-OPEN, UI 应 toast 提示
+	FilterStatusFallbackTkdistSkew  FilterStatus = "fallback-tkdist-deployment-skew" // tk-dist 返 404 (V30 二轮 B-P1-D), 部署版本不一致, SRE 需查 tk-dist
+	FilterStatusFallbackNoBuckets   FilterStatus = "fallback-no-buckets"             // V9 老用户无桶 fallback
+	FilterStatusFallbackMissingUser FilterStatus = "fallback-missing-userid"         // 防御性, 应永远不出现
+	FilterStatusUnknown             FilterStatus = ""                                // 未知/缺失 — 老 nexus / 非 V30 端点
 )
 
 // ListModelsWithStatus 获取可用模型列表, 同时返回 X-Entitlement-Filter-Status header.
@@ -671,8 +677,10 @@ func (c *Client) Chat(ctx context.Context, modelID string, req ChatRequest) (*Ch
 
 // ChatMessages Anthropic 原生格式同步聊天
 // v0.5.0: 根据 provider 自动路由
-//   Anthropic → chatMessagesAnthropic（现有路径，POST /anthropic）
-//   其他厂商 → chatMessagesOpenAI（POST /chat，响应转换为 AnthropicResponse）
+//
+//	Anthropic → chatMessagesAnthropic（现有路径，POST /anthropic）
+//	其他厂商 → chatMessagesOpenAI（POST /chat，响应转换为 AnthropicResponse）
+//
 // v0.13.x: 前置 ensureModelCached, 消除冷缓存硬编码回退。未知 modelID 返回 *ModelNotFoundError。
 func (c *Client) ChatMessages(ctx context.Context, modelID string, req ChatRequest) (*AnthropicResponse, error) {
 	m, err := c.ensureModelCached(ctx, modelID)
@@ -802,8 +810,9 @@ func (c *Client) ChatMessagesStream(ctx context.Context, modelID string, req Cha
 
 // chatMessagesStreamInternal 流式内部实现
 // v0.5.0: 根据 adapter 路由端点 + SSE 格式解析
-//   Anthropic → /anthropic 端点，原生 SSE 事件直透
-//   OpenAI    → /chat 端点，OpenAI SSE 转换为 Anthropic 兼容事件
+//
+//	Anthropic → /anthropic 端点，原生 SSE 事件直透
+//	OpenAI    → /chat 端点，OpenAI SSE 转换为 Anthropic 兼容事件
 func (c *Client) chatMessagesStreamInternal(ctx context.Context, modelID string, req ChatRequest,
 	eventCh chan<- StreamEvent, errCh chan<- error, retried bool) {
 
@@ -2205,6 +2214,12 @@ func (c *Client) forceRefresh(ctx context.Context) error {
 
 	tokenResp, err := RefreshToken(ctx, c.meta, c.tokens.ClientID, c.tokens.RefreshToken)
 	if err != nil {
+		if isInvalidGrantError(err) {
+			if clearErr := c.clearInvalidRefreshTokenLocked(); clearErr != nil {
+				fmt.Printf("[acosmi-sdk] warning: clear invalid token failed: %v\n", clearErr)
+			}
+			return fmt.Errorf("refresh token invalid; local tokens cleared: %w", err)
+		}
 		return err
 	}
 
@@ -2213,4 +2228,18 @@ func (c *Client) forceRefresh(ctx context.Context) error {
 		fmt.Printf("[acosmi-sdk] warning: save refreshed token failed: %v\n", saveErr)
 	}
 	return nil
+}
+
+func isInvalidGrantError(err error) bool {
+	var tokenErr *TokenEndpointError
+	return errors.As(err, &tokenErr) && tokenErr.OAuthError == "invalid_grant"
+}
+
+func (c *Client) clearInvalidRefreshTokenLocked() error {
+	c.tokens = nil
+	c.meta = nil
+	c.loginInFlight = false
+	c.tokenReady = make(chan struct{})
+	c.tokenOnce = sync.Once{}
+	return c.store.Clear()
 }
