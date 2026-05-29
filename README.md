@@ -57,6 +57,46 @@ func main() {
 > **v1.6.0 新特性**: `EndUserID` 字段 + 自动 SSE 保活解析 + 11min per-request 超时 (覆盖
 > DeepSeek 等上游 "开始推理前最长 10min 保活" 窗口)。详见 [开发手册 §13 §14](docs/guide.md)。
 
+### 图片 / 视频生成 (v1.1.0+)
+
+图片/视频生成与文本对话**同属托管模型网关**(同一个 `Client`、同一套 `models:chat` 鉴权面),**不是工作流**。只有 `Capabilities.SupportsImageGeneration` / `SupportsVideoGeneration` 为真的模型可调;计费结算在营销系统,SDK / 网关只做调用与用量上报。
+
+```go
+// 先按 capability 筛模型
+models, _ := client.ListModels(ctx)
+var imageModelID, videoModelID string
+for _, m := range models {
+    if m.Capabilities.SupportsImageGeneration { imageModelID = m.ID }
+    if m.Capabilities.SupportsVideoGeneration { videoModelID = m.ID }
+}
+
+// 图片 (同步): 一次调用直接拿图。无 deadline 时默认 11min 超时容纳上游。
+img, _ := client.GenerateImage(ctx, imageModelID, &acosmi.ImageGenerationRequest{
+    Prompt: "一只在雪地里奔跑的柴犬,电影感光影",
+    Width:  1024, // 缺省 1024
+    Height: 1024, // 缺省 1024
+    Style:  "cinematic",
+})
+fmt.Println(img.URL) // 或 img.B64JSON / img.RevisedPrompt
+
+// 视频 (异步): 建任务 → 轮询。durationSeconds 回传创建时秒数, 网关在 completed 时据此上报时长用量。
+task, _ := client.GenerateVideo(ctx, videoModelID, &acosmi.VideoGenerationRequest{
+    Prompt:     "海浪拍打礁石的慢镜头",
+    Resolution: "1280x720",
+    Duration:   5, // 秒
+})
+res := task
+for res.Status != "completed" && res.Status != "failed" {
+    time.Sleep(3 * time.Second)
+    res, _ = client.PollVideoTask(ctx, videoModelID, task.TaskID, 5) // 回传 duration=5
+}
+fmt.Println(res.VideoURL) // 失败时 res.Error
+```
+
+> 字段是网关**通用契约**(图片 `Prompt`/`Width`/`Height`/`Style`; 视频 `Prompt`/`Resolution`/`Duration`);
+> 某厂商支持哪些取值由上游模型决定。网关适配 OpenAI 兼容图片 + 火山引擎(即梦/豆包)视频 +
+> DashScope 通义万相(wanx)原生异步任务(图片+视频)。详见 [开发手册 §v1.1.0](docs/guide.md)。
+
 ### 作为 CLI 工具使用
 
 ```bash
