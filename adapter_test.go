@@ -48,6 +48,23 @@ func TestGetAdapterForModel_PreferredFormat(t *testing.T) {
 			model: ManagedModel{Provider: "dashscope"},
 			want:  FormatOpenAI,
 		},
+		{
+			// 护栏: preferred=anthropic 与 supported_formats 矛盾 → 不路由到不支持的格式
+			name:  "preferred anthropic ignored when supported_formats lacks it",
+			model: ManagedModel{Provider: "dashscope", PreferredFormat: "anthropic", SupportedFormats: []string{"openai"}},
+			want:  FormatOpenAI,
+		},
+		{
+			name:  "preferred openai ignored when supported_formats lacks it",
+			model: ManagedModel{Provider: "dashscope", PreferredFormat: "openai", SupportedFormats: []string{"anthropic"}},
+			want:  FormatAnthropic,
+		},
+		{
+			// preferred 在 supported 内 → 仍采信 (与 supported 顺序优先级无关)
+			name:  "preferred openai honored when in supported_formats",
+			model: ManagedModel{Provider: "dashscope", PreferredFormat: "openai", SupportedFormats: []string{"anthropic", "openai"}},
+			want:  FormatOpenAI,
+		},
 	}
 
 	for _, tc := range cases {

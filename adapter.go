@@ -66,7 +66,8 @@ func getAdapter(provider string) ProviderAdapter {
 // getAdapterForModel 按 ManagedModel 的 PreferredFormat / SupportedFormats 选择 adapter
 //
 // 决策顺序:
-//  1. PreferredFormat 非空 → 按其值返回 (anthropic | openai)
+//  1. PreferredFormat 非空 **且** 该格式在 SupportedFormats 内 (或 SupportedFormats 未声明)
+//     → 按其值返回 (anthropic | openai)
 //  2. SupportedFormats 含 "anthropic" → AnthropicAdapter
 //  3. SupportedFormats 含 "openai" → OpenAIAdapter
 //  4. 两字段均空 (旧上游) → 回落 provider 名硬编码 (原 getAdapter 行为)
@@ -74,14 +75,12 @@ func getAdapter(provider string) ProviderAdapter {
 // 这使得 dashscope / zhipu / deepseek 等 provider 的模型如果上游启用了
 // Anthropic 兼容端点 (providerAnthropicEndpoints 命中), 也能走 /anthropic 路径,
 // 不再被 provider 字符串硬编码到 /chat 导致 tool_reference 400.
+//
+// [格式一致性护栏 2026-05-29] PreferredFormat 仅在确被 SupportedFormats 收录时才采信:
+// 防止上游元数据漂移 (preferred_format=anthropic 但 supported_formats=[openai]) 把 SDK
+// 路由到模型并不支持的格式端点 (撞 /anthropic "未绑定 Anthropic" 4xx)。这是网关侧
+// "同 model_id 双 profile 选行" 根因修复在 SDK 侧的同构护栏。
 func getAdapterForModel(m ManagedModel) ProviderAdapter {
-	switch strings.ToLower(strings.TrimSpace(m.PreferredFormat)) {
-	case "anthropic":
-		return &AnthropicAdapter{}
-	case "openai":
-		return &OpenAIAdapter{}
-	}
-
 	hasAnthropic := false
 	hasOpenAI := false
 	for _, f := range m.SupportedFormats {
@@ -92,6 +91,19 @@ func getAdapterForModel(m ManagedModel) ProviderAdapter {
 			hasOpenAI = true
 		}
 	}
+	declared := hasAnthropic || hasOpenAI
+
+	switch strings.ToLower(strings.TrimSpace(m.PreferredFormat)) {
+	case "anthropic":
+		if !declared || hasAnthropic {
+			return &AnthropicAdapter{}
+		}
+	case "openai":
+		if !declared || hasOpenAI {
+			return &OpenAIAdapter{}
+		}
+	}
+
 	if hasAnthropic {
 		return &AnthropicAdapter{}
 	}
