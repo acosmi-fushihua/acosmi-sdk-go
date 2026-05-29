@@ -675,6 +675,59 @@ func (c *Client) Chat(ctx context.Context, modelID string, req ChatRequest) (*Ch
 	return resp, nil
 }
 
+// =============================================================================
+// 媒体生成 (v1.1+) — 图片 / 视频生成托管模型 (与 Chat 同网关)
+//
+// 仅对 capabilities.supports_image_generation / supports_video_generation 的模型有效。
+// 网关不算钱; 用量由网关上报营销系统结算。
+// =============================================================================
+
+// GenerateImage 同步图片生成。POST /managed-models/:id/images/generations
+//
+// modelID 须为图片生成托管模型 (capabilities.supports_image_generation=true)。
+func (c *Client) GenerateImage(ctx context.Context, modelID string, req *ImageGenerationRequest) (*ImageGenerationResponse, error) {
+	// 图片生成耗时常超 30s, 与 Chat 同级超时容纳上游。
+	if _, hasDeadline := ctx.Deadline(); !hasDeadline {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, chatRequestTimeout)
+		defer cancel()
+	}
+	endpoint := "/managed-models/" + url.PathEscape(modelID) + "/images/generations"
+	var env APIResponse[ImageGenerationResponse]
+	if _, err := c.doJSONFull(ctx, http.MethodPost, endpoint, req, &env); err != nil {
+		return nil, err
+	}
+	return &env.Data, nil
+}
+
+// GenerateVideo 创建异步视频生成任务, 返回含 TaskID 的响应。
+// POST /managed-models/:id/videos/generations
+//
+// 用 PollVideoTask 轮询直到 Status=completed。
+func (c *Client) GenerateVideo(ctx context.Context, modelID string, req *VideoGenerationRequest) (*VideoTaskResponse, error) {
+	endpoint := "/managed-models/" + url.PathEscape(modelID) + "/videos/generations"
+	var env APIResponse[VideoTaskResponse]
+	if _, err := c.doJSONFull(ctx, http.MethodPost, endpoint, req, &env); err != nil {
+		return nil, err
+	}
+	return &env.Data, nil
+}
+
+// PollVideoTask 轮询视频任务状态。GET /managed-models/:id/videos/tasks/:taskId
+//
+// durationSeconds 为创建时的时长 (秒), 透传给网关在 completed 时上报真物理量 (视频秒数); 传 0 省略。
+func (c *Client) PollVideoTask(ctx context.Context, modelID, taskID string, durationSeconds int) (*VideoTaskResponse, error) {
+	endpoint := "/managed-models/" + url.PathEscape(modelID) + "/videos/tasks/" + url.PathEscape(taskID)
+	if durationSeconds > 0 {
+		endpoint += "?duration=" + url.QueryEscape(strconv.Itoa(durationSeconds))
+	}
+	var env APIResponse[VideoTaskResponse]
+	if _, err := c.doJSONFull(ctx, http.MethodGet, endpoint, nil, &env); err != nil {
+		return nil, err
+	}
+	return &env.Data, nil
+}
+
 // ChatMessages Anthropic 原生格式同步聊天
 // v0.5.0: 根据 provider 自动路由
 //

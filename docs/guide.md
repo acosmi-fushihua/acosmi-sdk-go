@@ -2164,6 +2164,76 @@ make install    # → $GOPATH/bin
 
 ## 12. 版本记录
 
+### v1.1.0 (2026-05-29) — 托管模型图片/视频生成 (additive minor)
+
+**性质**: 纯新增, 公开类型 / 方法签名零移除、零改名。图片/视频生成与文本模型同属托管模型网关 (同 `Client`、同 `models:chat` 鉴权面), 仅 `capabilities.supports_image_generation` / `supports_video_generation` 的模型可用。计费结算在营销系统, SDK / 网关只负责调用与用量上报。
+
+**新增方法**:
+- `Client.GenerateImage(ctx, modelID, *ImageGenerationRequest) (*ImageGenerationResponse, error)` — 同步图片生成, `POST /managed-models/:id/images/generations`。无 deadline 时默认 11min 超时 (与 Chat 同级) 容纳上游耗时。
+- `Client.GenerateVideo(ctx, modelID, *VideoGenerationRequest) (*VideoTaskResponse, error)` — 创建异步视频任务, 返回 `TaskID`。
+- `Client.PollVideoTask(ctx, modelID, taskID string, durationSeconds int) (*VideoTaskResponse, error)` — 轮询视频任务; `durationSeconds` 透传给网关在 `completed` 时上报真物理量 (视频秒数), 传 0 省略。
+
+**新增类型**: `ImageGenerationRequest` / `ImageGenerationResponse` / `VideoGenerationRequest` / `VideoTaskResponse`。
+
+**ModelCapabilities 新增字段** (omitempty, 向后兼容): `SupportsImageGeneration` / `SupportsVideoGeneration`。上游未声明时为零值 false; 调用方不得用模型名 substring 推断。
+
+**网关侧适配范围**: OpenAI 兼容图片端点 + 火山引擎 (即梦/豆包) 视频任务 + DashScope 通义万相 (wanx) 原生异步任务 API (图片 + 视频)。万相图片在网关内部建任务并轮询到终态后同步返回 URL (对 SDK 仍是一次 `GenerateImage`); 视频走 `GenerateVideo` + `PollVideoTask`。
+
+**完整示例**:
+
+```go
+// 先按 capability 筛模型 (严禁用模型名 substring 推断)
+models, _ := client.ListModels(ctx)
+var imageModelID, videoModelID string
+for _, m := range models {
+    if m.Capabilities.SupportsImageGeneration {
+        imageModelID = m.ID
+    }
+    if m.Capabilities.SupportsVideoGeneration {
+        videoModelID = m.ID
+    }
+}
+
+// 图片 (同步): 一次调用直接拿图
+img, err := client.GenerateImage(ctx, imageModelID, &acosmi.ImageGenerationRequest{
+    Prompt: "一只在雪地里奔跑的柴犬, 电影感光影",
+    Width:  1024, // 缺省 1024
+    Height: 1024, // 缺省 1024
+    Style:  "cinematic",
+})
+if err != nil {
+    log.Fatal(err)
+}
+fmt.Println(img.URL) // 或 img.B64JSON / img.RevisedPrompt
+
+// 视频 (异步): 建任务 → 轮询
+task, err := client.GenerateVideo(ctx, videoModelID, &acosmi.VideoGenerationRequest{
+    Prompt:     "海浪拍打礁石的慢镜头",
+    Resolution: "1280x720",
+    Duration:   5, // 秒
+})
+if err != nil {
+    log.Fatal(err)
+}
+res := task
+for res.Status != "completed" && res.Status != "failed" {
+    time.Sleep(3 * time.Second)
+    // 第 4 参数回传创建时秒数, 网关在 completed 时据此上报时长用量; 传 0 省略
+    res, err = client.PollVideoTask(ctx, videoModelID, task.TaskID, 5)
+    if err != nil {
+        log.Fatal(err)
+    }
+}
+if res.Status == "failed" {
+    log.Fatalf("video failed: %s", res.Error)
+}
+fmt.Println(res.VideoURL)
+```
+
+> 字段是网关**通用契约** (图片 `Prompt`/`Width`/`Height`/`Style`; 视频 `Prompt`/`Resolution`/`Duration`); 某厂商支持哪些取值由上游模型决定 (如万相尺寸 `宽*高` 星号格式由网关代转)。
+
+---
+
 ### v1.0.0 (2026-05-01) — 联动稳定测试版基线 (Go SDK + TS SDK 同步里程碑)
 
 **性质**: 版本号晋升 (基于 v0.20.0 changelog 内容), 无新增代码改动 / 无新 breaking change。Go + TS git tree 即当前 main HEAD `53272b7 docs(sdk): T3 raw 1:1 同步`。
