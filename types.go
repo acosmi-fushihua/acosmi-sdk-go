@@ -268,6 +268,49 @@ type ModelCapabilities struct {
 	// Token 上限 (冗余但便于查询)
 	MaxInputTokens  int `json:"max_input_tokens"`
 	MaxOutputTokens int `json:"max_output_tokens"`
+
+	// 生成能力 (v1.1+): 为 true 表示该托管模型是图片/视频生成模型, 应走
+	// GenerateImage / GenerateVideo 而非 Chat。计量维度由上游派生为 IMAGE / VIDEO。
+	// 调用方不得用模型名 substring 推断, 必须读上游下发字段。
+	SupportsImageGeneration bool `json:"supports_image_generation,omitempty"` // DALL·E / SD / 即梦 等
+	SupportsVideoGeneration bool `json:"supports_video_generation,omitempty"` // Sora / 可灵 / Runway 等
+}
+
+// =============================================================================
+// 媒体生成请求/响应 (托管模型 image/video 生成端点, v1.1+)
+// 与 Chat 同网关、同 ManagedModel; 仅 capabilities.supports_image/video_generation 模型可用。
+// =============================================================================
+
+// ImageGenerationRequest 图片生成请求 (Client.GenerateImage)
+type ImageGenerationRequest struct {
+	Prompt string `json:"prompt"`
+	Width  int    `json:"width,omitempty"`  // 缺省 1024
+	Height int    `json:"height,omitempty"` // 缺省 1024
+	Style  string `json:"style,omitempty"`
+}
+
+// ImageGenerationResponse 图片生成响应
+type ImageGenerationResponse struct {
+	URL           string `json:"url,omitempty"`
+	B64JSON       string `json:"b64_json,omitempty"`
+	RevisedPrompt string `json:"revised_prompt,omitempty"`
+	RequestID     string `json:"requestId,omitempty"`
+}
+
+// VideoGenerationRequest 视频生成请求 (Client.GenerateVideo)
+type VideoGenerationRequest struct {
+	Prompt     string `json:"prompt"`
+	Resolution string `json:"resolution,omitempty"`
+	Duration   int    `json:"duration,omitempty"` // 秒
+}
+
+// VideoTaskResponse 视频任务响应 (创建返回 TaskID; 轮询返回 Status/VideoURL)
+type VideoTaskResponse struct {
+	TaskID    string `json:"taskId"`
+	Status    string `json:"status,omitempty"` // pending | running | completed | failed
+	VideoURL  string `json:"videoUrl,omitempty"`
+	Error     string `json:"error,omitempty"`
+	RequestID string `json:"requestId,omitempty"`
 }
 
 // [RC-2] ModelUsage 已移除: /managed-models/usage 端点已迁移至 tk-dist
