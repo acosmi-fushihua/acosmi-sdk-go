@@ -70,7 +70,11 @@ func main() {
 	} else {
 		fmt.Printf("\n流量包商城 (%d 个):\n", len(packages))
 		for _, p := range packages {
-			fmt.Printf("  - %s: %d Token / %s 元 / %d 天\n", p.Name, p.TokenQuota, p.Price, p.ValidDays)
+			fmt.Printf("  - %s: 原价 %.2f 元 / 活动价 %.2f 元 / %s\n",
+				p.Name,
+				float64(p.OriginalPriceCent)/100,
+				float64(p.CampaignPriceCent)/100,
+				p.BillingCycle)
 		}
 	}
 

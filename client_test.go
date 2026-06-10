@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -338,14 +339,15 @@ func TestWaitForPayment_Success(t *testing.T) {
 	var callCount int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		n := atomic.AddInt32(&callCount, 1)
-		status := "UNPAID"
+		// 真实 BuyResponse 形状: paymentStatus (回退 orderStatus), 无 status 字段。
+		paymentStatus := "NOTPAY"
 		if n >= 3 {
-			status = "PAID"
+			paymentStatus = "SUCCESS"
 		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]interface{}{
 			"code": 0,
-			"data": map[string]interface{}{"orderId": "order-123", "status": status},
+			"data": map[string]interface{}{"orderId": 123, "orderNo": "order-123", "paymentStatus": paymentStatus, "orderStatus": "PENDING"},
 		})
 	}))
 	defer server.Close()
@@ -358,8 +360,8 @@ func TestWaitForPayment_Success(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if status.Status != "PAID" {
-		t.Errorf("expected PAID, got %s", status.Status)
+	if status.PaymentStatus != "SUCCESS" {
+		t.Errorf("expected SUCCESS, got %s", status.PaymentStatus)
 	}
 	if n := atomic.LoadInt32(&callCount); n < 3 {
 		t.Errorf("expected at least 3 polls, got %d", n)
@@ -369,22 +371,23 @@ func TestWaitForPayment_Success(t *testing.T) {
 func TestWaitForPayment_TerminalFailure(t *testing.T) {
 	server := httptest.NewServer(jsonHandler(map[string]interface{}{
 		"code": 0,
-		"data": map[string]interface{}{"orderId": "order-456", "status": "CANCELLED"},
+		// orderStatus=EXPIRED 是 tk-dist 真实失败终态; paymentStatus 留空 → 回退 orderStatus。
+		"data": map[string]interface{}{"orderId": 456, "orderNo": "order-456", "orderStatus": "EXPIRED"},
 	}))
 	defer server.Close()
 
 	c := testClient(t, server.URL)
 	status, err := c.WaitForPayment(context.Background(), "order-456", 50*time.Millisecond)
 	if err == nil {
-		t.Fatal("expected error for CANCELLED order, got nil")
+		t.Fatal("expected error for EXPIRED order, got nil")
 	}
 
 	var termErr *OrderTerminalError
 	if !errors.As(err, &termErr) {
 		t.Fatalf("expected *OrderTerminalError, got %T: %v", err, err)
 	}
-	if termErr.Status != "CANCELLED" {
-		t.Errorf("expected status CANCELLED, got %s", termErr.Status)
+	if termErr.Status != "EXPIRED" {
+		t.Errorf("expected status EXPIRED, got %s", termErr.Status)
 	}
 	if status == nil {
 		t.Fatal("expected non-nil status even on terminal failure")
@@ -394,7 +397,8 @@ func TestWaitForPayment_TerminalFailure(t *testing.T) {
 func TestWaitForPayment_Timeout(t *testing.T) {
 	server := httptest.NewServer(jsonHandler(map[string]interface{}{
 		"code": 0,
-		"data": map[string]interface{}{"orderId": "order-789", "status": "UNPAID"},
+		// NOTPAY 是非终态 → 持续轮询直到 ctx 超时。
+		"data": map[string]interface{}{"orderId": 789, "orderNo": "order-789", "paymentStatus": "NOTPAY"},
 	}))
 	defer server.Close()
 
@@ -411,18 +415,18 @@ func TestWaitForPayment_Timeout(t *testing.T) {
 func TestWaitForPayment_DefaultInterval(t *testing.T) {
 	server := httptest.NewServer(jsonHandler(map[string]interface{}{
 		"code": 0,
-		"data": map[string]interface{}{"orderId": "order-x", "status": "PAID"},
+		"data": map[string]interface{}{"orderId": 999, "orderNo": "order-x", "paymentStatus": "SUCCESS", "orderStatus": "PAID"},
 	}))
 	defer server.Close()
 
 	c := testClient(t, server.URL)
-	// pollInterval=0 → 默认 2s, 但首次查询立即返回 PAID
+	// pollInterval=0 → 默认 2s, 但首次查询立即返回 SUCCESS
 	status, err := c.WaitForPayment(context.Background(), "order-x", 0)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if status.Status != "PAID" {
-		t.Errorf("expected PAID, got %s", status.Status)
+	if status.PaymentStatus != "SUCCESS" {
+		t.Errorf("expected SUCCESS, got %s", status.PaymentStatus)
 	}
 }
 
@@ -441,29 +445,32 @@ func TestPurchaseChain_EndToEnd(t *testing.T) {
 			json.NewEncoder(w).Encode(map[string]interface{}{
 				"code": 0,
 				"data": []map[string]interface{}{
-					{"id": "pkg-basic", "name": "基础包", "tokenQuota": 100000, "price": "9.9", "validDays": 30, "isEnabled": true},
+					{"id": "pkg-basic", "name": "基础包", "originalPriceCent": 990, "campaignPriceCent": 990, "billingCycle": "monthly"},
 				},
 			})
 
-		// Step 2: Buy
+		// Step 2: Buy → BuyResponse 形状
 		case strings.Contains(path, "/buy") && r.Method == "POST":
 			json.NewEncoder(w).Encode(map[string]interface{}{
 				"code": 0,
 				"data": map[string]interface{}{
-					"id":          "order-e2e",
-					"packageId":   "pkg-basic",
-					"packageName": "基础包",
-					"amount":      "9.9",
-					"status":      "UNPAID",
-					"payUrl":      "https://pay.example.com/order-e2e",
+					"orderId":       42,
+					"orderNo":       "order-e2e",
+					"productId":     "pkg-basic",
+					"productName":   "基础包",
+					"amountFen":     990,
+					"orderStatus":   "PENDING",
+					"paymentMethod": "ALIPAY_PRECREATE",
+					"paymentStatus": "CREATED",
+					"payUrl":        "https://pay.example.com/order-e2e",
 				},
 			})
 
-		// Step 3: Order status (immediately PAID for E2E simplicity)
+		// Step 3: Order status (immediately SUCCESS for E2E simplicity)
 		case strings.Contains(path, "/status"):
 			json.NewEncoder(w).Encode(map[string]interface{}{
 				"code": 0,
-				"data": map[string]interface{}{"orderId": "order-e2e", "status": "PAID"},
+				"data": map[string]interface{}{"orderId": 42, "orderNo": "order-e2e", "paymentStatus": "SUCCESS", "orderStatus": "PAID"},
 			})
 
 		// Step 4: Balance
@@ -504,20 +511,23 @@ func TestPurchaseChain_EndToEnd(t *testing.T) {
 	if err != nil {
 		t.Fatalf("BuyTokenPackage: %v", err)
 	}
-	if order.ID != "order-e2e" {
-		t.Errorf("expected order-e2e, got %s", order.ID)
+	if order.OrderNo != "order-e2e" {
+		t.Errorf("expected order-e2e, got %s", order.OrderNo)
+	}
+	if order.OrderID != 42 {
+		t.Errorf("expected orderId 42, got %d", order.OrderID)
 	}
 	if order.PayURL == "" {
 		t.Error("expected payUrl")
 	}
 
-	// Step 3: Wait for payment
-	status, err := c.WaitForPayment(ctx, order.ID, 50*time.Millisecond)
+	// Step 3: Wait for payment (orderId 是 int64, 轮询用字符串)
+	status, err := c.WaitForPayment(ctx, strconv.FormatInt(order.OrderID, 10), 50*time.Millisecond)
 	if err != nil {
 		t.Fatalf("WaitForPayment: %v", err)
 	}
-	if status.Status != "PAID" {
-		t.Errorf("expected PAID, got %s", status.Status)
+	if status.PaymentStatus != "SUCCESS" {
+		t.Errorf("expected SUCCESS, got %s", status.PaymentStatus)
 	}
 
 	// Step 4: Verify balance

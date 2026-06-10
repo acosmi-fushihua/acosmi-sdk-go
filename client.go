@@ -1434,46 +1434,59 @@ func (c *Client) GetTokenPackageDetail(ctx context.Context, packageID string) (*
 	return &resp.Data, nil
 }
 
-// BuyTokenPackage 购买流量包 (创建订单)
-func (c *Client) BuyTokenPackage(ctx context.Context, packageID string, payload *PayPayload) (*Order, error) {
+// BuyTokenPackage 购买流量包 (创建订单)。
+// 返回 BuyResponse (含 OrderID/OrderNo/PayURL/QRCodeContent 等支付引导字段)。
+func (c *Client) BuyTokenPackage(ctx context.Context, packageID string, payload *PayPayload) (*BuyResponse, error) {
 	var body interface{}
 	if payload != nil {
 		body = payload
 	}
-	var resp APIResponse[Order]
+	var resp APIResponse[BuyResponse]
 	if err := c.doJSON(ctx, http.MethodPost, "/token-packages/"+url.PathEscape(packageID)+"/buy", body, &resp, false); err != nil {
 		return nil, err
 	}
 	return &resp.Data, nil
 }
 
-// GetOrderStatus 查询订单支付状态
-func (c *Client) GetOrderStatus(ctx context.Context, orderID string) (*OrderStatus, error) {
-	var resp APIResponse[OrderStatus]
+// GetOrderStatus 查询订单支付状态。
+// 返回 BuyResponse (买接口同一形状); 终态判定看 PaymentStatus (回退 OrderStatus)。
+func (c *Client) GetOrderStatus(ctx context.Context, orderID string) (*BuyResponse, error) {
+	var resp APIResponse[BuyResponse]
 	if err := c.doJSON(ctx, http.MethodGet, "/token-packages/orders/"+url.PathEscape(orderID)+"/status", nil, &resp, false); err != nil {
 		return nil, err
 	}
 	return &resp.Data, nil
 }
 
-// ListMyOrders 查询我的订单列表
+// ListMyOrders 查询我的订单列表。
+// 返回 OrderListItem (toOrderMap 形状: AmountCent / PayStatus / CommissionStatus 等)。
 // 兼容 yudao 分页格式 {"data":{"list":[...],"total":N}} 和直接数组 {"data":[...]}
-func (c *Client) ListMyOrders(ctx context.Context) ([]Order, error) {
+func (c *Client) ListMyOrders(ctx context.Context) ([]OrderListItem, error) {
 	var raw APIResponse[json.RawMessage]
 	if err := c.doJSON(ctx, http.MethodGet, "/token-packages/my", nil, &raw, false); err != nil {
 		return nil, err
 	}
 	// 尝试 yudao 分页格式
-	var page YudaoPageResult[Order]
+	var page YudaoPageResult[OrderListItem]
 	if json.Unmarshal(raw.Data, &page) == nil && page.List != nil {
 		return page.List, nil
 	}
 	// 降级: 直接数组
-	var orders []Order
+	var orders []OrderListItem
 	if err := json.Unmarshal(raw.Data, &orders); err != nil {
 		return nil, fmt.Errorf("decode orders: %w", err)
 	}
 	return orders, nil
+}
+
+// orderTerminalStatus 从 BuyResponse 取用于终态判定的状态字段:
+// 优先 PaymentStatus (CREATED/NOTPAY/SUCCESS/...), 回退 OrderStatus (PENDING/PAID/...)。
+// 与 NexusProxyController.toOrderMap 的 payStatus 取值口径一致。
+func orderTerminalStatus(r *BuyResponse) string {
+	if r.PaymentStatus != "" {
+		return r.PaymentStatus
+	}
+	return r.OrderStatus
 }
 
 // WaitForPayment 轮询订单支付状态直到终态
@@ -1483,10 +1496,13 @@ func (c *Client) ListMyOrders(ctx context.Context) ([]Order, error) {
 //
 // 购买链路典型用法:
 //
-//	order, _ := client.BuyTokenPackage(ctx, pkgID, nil)
-//	// 用户在 order.PayURL 完成支付 ...
-//	status, err := client.WaitForPayment(ctx, order.ID, 3*time.Second)
-func (c *Client) WaitForPayment(ctx context.Context, orderID string, pollInterval time.Duration) (*OrderStatus, error) {
+//	resp, _ := client.BuyTokenPackage(ctx, pkgID, nil)
+//	// 用户在 resp.PayURL / resp.QRCodeContent 完成支付 ...
+//	status, err := client.WaitForPayment(ctx, strconv.FormatInt(resp.OrderID, 10), 3*time.Second)
+//
+// 终态判定基于 PaymentStatus (回退 OrderStatus)。真实响应无 status 字段, 旧版读
+// status.Status 恒空 → isOrderTerminal("") 恒 false → 永不返回 (无限轮询)。
+func (c *Client) WaitForPayment(ctx context.Context, orderID string, pollInterval time.Duration) (*BuyResponse, error) {
 	if pollInterval <= 0 {
 		pollInterval = 2 * time.Second
 	}
@@ -1500,11 +1516,12 @@ func (c *Client) WaitForPayment(ctx context.Context, orderID string, pollInterva
 			return nil, err
 		}
 
-		if isOrderTerminal(status.Status) {
-			if isOrderSuccess(status.Status) {
+		st := orderTerminalStatus(status)
+		if isOrderTerminal(st) {
+			if isOrderSuccess(st) {
 				return status, nil
 			}
-			return status, &OrderTerminalError{OrderID: orderID, Status: status.Status}
+			return status, &OrderTerminalError{OrderID: orderID, Status: st}
 		}
 
 		select {
@@ -1515,6 +1532,10 @@ func (c *Client) WaitForPayment(ctx context.Context, orderID string, pollInterva
 	}
 }
 
+// isOrderSuccess 终态成功枚举。
+// 取值来源 (tk-dist OrderPaymentService 常量):
+//   PAY_SUCCESS="SUCCESS" (paymentStatus) / STATUS_PAID="PAID" (orderStatus)。
+//   COMPLETED 为防御性保留 (TS SDK 2.6.0 对齐)。
 func isOrderSuccess(status string) bool {
 	switch status {
 	case "PAID", "SUCCESS", "COMPLETED":
@@ -1523,10 +1544,18 @@ func isOrderSuccess(status string) bool {
 	return false
 }
 
+// isOrderTerminal 终态枚举 (成功或失败)。
+// 取值来源 (tk-dist OrderPaymentService 常量):
+//   成功: PAID / SUCCESS (+ COMPLETED 防御)。
+//   失败终态: STATUS_EXPIRED="EXPIRED" / PAY_REJECTED="REJECTED" /
+//             STATUS_REFUNDED=PAY_REFUNDED="REFUNDED"。
+//   FAILED / CANCELLED / CLOSED 为防御性保留 (跨渠道/TS SDK 2.6.0 对齐)。
+// 非终态 (继续轮询): CREATED / NOTPAY / PENDING / PENDING_REVIEW /
+//                    AWAITING_REMITTANCE / REFUNDING。
 func isOrderTerminal(status string) bool {
 	switch status {
 	case "PAID", "SUCCESS", "COMPLETED",
-		"FAILED", "CANCELLED", "CLOSED", "EXPIRED", "REFUNDED":
+		"FAILED", "CANCELLED", "CLOSED", "EXPIRED", "REFUNDED", "REJECTED":
 		return true
 	}
 	return false
@@ -1901,19 +1930,28 @@ func (c *Client) DeleteNotification(ctx context.Context, id string) error {
 	return c.doJSON(ctx, http.MethodDelete, "/notifications/"+url.PathEscape(id), nil, &resp, false)
 }
 
-// RegisterDevice 注册推送设备 token
+// RegisterDevice 注册推送设备 token。
+//
+// Deprecated: 网关 (nexus-v4 backend) 尚未提供 /devices/* 端点, 调用必返 404。
+// 后端实现落地前请勿在生产使用 (与 TS SDK 2.6.0 @experimental 标注一致)。
 func (c *Client) RegisterDevice(ctx context.Context, reg DeviceRegistration) error {
 	var resp APIResponse[any]
 	return c.doJSON(ctx, http.MethodPost, "/devices/register", reg, &resp, false)
 }
 
-// UnregisterDevice 注销推送设备 token
+// UnregisterDevice 注销推送设备 token。
+//
+// Deprecated: 网关 (nexus-v4 backend) 尚未提供 /devices/* 端点, 调用必返 404。
+// 后端实现落地前请勿在生产使用 (与 TS SDK 2.6.0 @experimental 标注一致)。
 func (c *Client) UnregisterDevice(ctx context.Context, token string) error {
 	var resp APIResponse[any]
 	return c.doJSON(ctx, http.MethodDelete, "/devices/"+url.PathEscape(token), nil, &resp, false)
 }
 
-// ListNotificationPreferences 获取通知偏好设置
+// ListNotificationPreferences 获取通知偏好设置。
+//
+// Deprecated: 网关 (nexus-v4 backend) 尚未提供 /notification-preferences/* 端点,
+// 调用必返 404。后端实现落地前请勿在生产使用 (与 TS SDK 2.6.0 @experimental 一致)。
 func (c *Client) ListNotificationPreferences(ctx context.Context) ([]NotificationPreference, error) {
 	var resp APIResponse[[]NotificationPreference]
 	if err := c.doJSON(ctx, http.MethodGet, "/notification-preferences", nil, &resp, false); err != nil {
@@ -1922,7 +1960,10 @@ func (c *Client) ListNotificationPreferences(ctx context.Context) ([]Notificatio
 	return resp.Data, nil
 }
 
-// UpdateNotificationPreference 更新通知偏好
+// UpdateNotificationPreference 更新通知偏好。
+//
+// Deprecated: 网关 (nexus-v4 backend) 尚未提供 /notification-preferences/* 端点,
+// 调用必返 404。后端实现落地前请勿在生产使用 (与 TS SDK 2.6.0 @experimental 一致)。
 func (c *Client) UpdateNotificationPreference(ctx context.Context, typeCode string, pref NotificationPreference) error {
 	var resp APIResponse[any]
 	return c.doJSON(ctx, http.MethodPut, "/notification-preferences/"+url.PathEscape(typeCode), pref, &resp, false)

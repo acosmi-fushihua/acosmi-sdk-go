@@ -1075,17 +1075,19 @@ for _, m := range models {
 > scope: `ai`
 
 ```go
-packages, _ := client.ListTokenPackages(ctx)               // 浏览
+packages, _ := client.ListTokenPackages(ctx)               // 浏览 ([]TokenPackage)
 pkg, _ := client.GetTokenPackageDetail(ctx, "pkg-id")      // 详情
-order, _ := client.BuyTokenPackage(ctx, "pkg-id", &acosmi.PayPayload{PayMethod: "alipay"}) // 下单
-status, _ := client.GetOrderStatus(ctx, "order-id")        // 状态
-orders, _ := client.ListMyOrders(ctx)                       // 我的订单
+// 下单 → *BuyResponse (OrderID int64 / OrderNo / PayURL / QRCodeContent ...)
+order, _ := client.BuyTokenPackage(ctx, "pkg-id", &acosmi.PayPayload{PaymentMethod: acosmi.PayMethodAlipayPrecreate})
+status, _ := client.GetOrderStatus(ctx, "order-id")        // 状态 (*BuyResponse)
+orders, _ := client.ListMyOrders(ctx)                       // 我的订单 ([]OrderListItem)
 
 // 轮询支付状态至终态 (购买链路典型用法)
-// pollInterval <= 0 时默认 2s; 成功返回 (status, nil); 终态失败返回 (*OrderTerminalError)
+// pollInterval <= 0 时默认 2s; 成功返回 (*BuyResponse, nil); 终态失败返回 (*OrderTerminalError)
+// 终态判定看 PaymentStatus (回退 OrderStatus); OrderID 是 int64 → 用 strconv 转字符串
 ctx2, cancel := context.WithTimeout(ctx, 5*time.Minute)
 defer cancel()
-finalStatus, err := client.WaitForPayment(ctx2, order.ID, 3*time.Second)
+finalStatus, err := client.WaitForPayment(ctx2, strconv.FormatInt(order.OrderID, 10), 3*time.Second)
 ```
 
 ### 4.6 钱包
@@ -1700,19 +1702,39 @@ type ModelCoefficient struct {
 ### 商城 / 钱包
 
 ```go
+// 形状对齐网关 /token-packages (→ tk-dist toProductView)。价格单位「分」。
 type TokenPackage struct {
-    ID, Name, Description string; TokenQuota int64; CallQuota int
-    Price json.Number; ValidDays int; IsEnabled bool; SortOrder int
+    ID, Name, Description string
+    OriginalPriceCent, CampaignPriceCent, RenewalPriceCent int64
+    DiscountRate json.Number; ModelsJSON, ProductImage string
+    Features []string; BillingCycle string; Featured bool
+    Eyebrow, Promo, Usage string; SortOrder int
 }
 
-type Order struct {
-    ID, PackageID, PackageName string; Amount json.Number
-    Status, PayURL, CreatedAt string // pending|paid|expired|cancelled
+// 下单 / 订单状态响应 (对齐 tk-dist OrderPaymentService.BuyResponse, 买与查共用)。
+type BuyResponse struct {
+    OrderID int64; OrderNo, ProductID, ProductName string
+    AmountFen int64; OrderStatus, PaymentMethod, PaymentStatus string
+    QRCodeContent, PayURL, PaymentExpiresAt string
+    BankTransferInfo *BankTransferInfo
 }
 
-type OrderStatus struct { OrderID, Status string }
+// 我的订单列表行 (对齐网关 /token-packages/my → toOrderMap)。
+type OrderListItem struct {
+    ID, BizOrderID, ProductName string; AmountCent, OriginalPriceCent int64
+    DiscountRate, PaymentMethod, PayStatus, CommissionStatus string
+    IssueStatus, ChannelCode, CreatedAt, PayTime string
+}
 
-type PayPayload struct { PayMethod string } // alipay | wechat 等
+// Deprecated 别名 (= BuyResponse), 仅向后兼容:
+type Order = BuyResponse
+type OrderStatus = BuyResponse
+
+type PayMethod string // WECHAT_NATIVE | ALIPAY_PRECREATE | BANK_TRANSFER
+type PayPayload struct {
+    PaymentMethod PayMethod // 字段名必须是 paymentMethod (后端 BuyRequest.paymentMethod)
+    DeviceID, ClientRequestID string
+}
 
 type WalletStats struct {
     Balance, MonthlyConsumption, MonthlyRecharge json.Number
@@ -1720,8 +1742,8 @@ type WalletStats struct {
 }
 type Transaction struct { ID, Type string; Amount json.Number; Remark, CreatedAt string }
 
-func (c *Client) WaitForPayment(ctx, orderID, pollInterval) (*OrderStatus, error)
-// 成功→(status, nil); 非成功终态→(*OrderTerminalError); 超时→ctx.Err()
+func (c *Client) WaitForPayment(ctx, orderID, pollInterval) (*BuyResponse, error)
+// 终态判定: PaymentStatus 回退 OrderStatus。成功→(resp, nil); 非成功终态→(*OrderTerminalError); 超时→ctx.Err()
 ```
 
 ### 技能

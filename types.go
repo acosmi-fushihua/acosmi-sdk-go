@@ -784,16 +784,29 @@ type EntitlementBalance struct {
 	ActiveEntitlements  int   `json:"activeEntitlements"`
 }
 
-// BalanceDetail 详细余额 (含每条权益明细)
+// BalanceDetailEntitlement 详细余额中的单条权益明细。
+//
+// 形状严格对齐网关 model.InternalEntitlementBrief (GetBalanceDetail 直透 tk-dist)。
+type BalanceDetailEntitlement struct {
+	ID            string  `json:"id"`
+	SourceOrderID string  `json:"sourceOrderId,omitempty"`
+	Status        string  `json:"status"`
+	TokenQuota    int64   `json:"tokenQuota"`
+	TokenUsed     int64   `json:"tokenUsed"`
+	ExpiresAt     *string `json:"expiresAt,omitempty"`
+}
+
+// BalanceDetail 详细余额 (含每条权益明细)。
+//
+// 形状严格对齐网关 model.InternalBalanceResponse (entitlement.go GetBalanceDetail 直透)。
+// 旧形状 (Total* 聚合 + EntitlementItem) 与真实响应不符, 会反序列化为全零。
 type BalanceDetail struct {
-	TotalTokenQuota     int64             `json:"totalTokenQuota"`
-	TotalTokenUsed      int64             `json:"totalTokenUsed"`
-	TotalTokenRemaining int64             `json:"totalTokenRemaining"`
-	TotalCallQuota      int               `json:"totalCallQuota"`
-	TotalCallUsed       int               `json:"totalCallUsed"`
-	TotalCallRemaining  int               `json:"totalCallRemaining"`
-	ActiveEntitlements  int               `json:"activeEntitlements"`
-	Entitlements        []EntitlementItem  `json:"entitlements"`
+	UserID         string                     `json:"userId"`
+	TokenRemaining int64                      `json:"tokenRemaining"`
+	TokenTotal     int64                      `json:"tokenTotal"`
+	CallRemaining  int                        `json:"callRemaining"`
+	CallTotal      int                        `json:"callTotal"`
+	Entitlements   []BalanceDetailEntitlement `json:"entitlements"`
 }
 
 // EntitlementItem 单条权益明细
@@ -811,18 +824,28 @@ type EntitlementItem struct {
 	SourceID       string  `json:"sourceId,omitempty"`
 	SourceType     string  `json:"sourceType,omitempty"`
 	Remark         string  `json:"remark,omitempty"`
-	CreatedAt      string  `json:"createdAt"`
+	// 仅出现在 /grants map (toEntitlementMap 之外的 grants 端点)。
+	CreatedAt string `json:"createdAt,omitempty"`
+	// list (toEntitlementMap) 与 grants 均返回 activatedAt。
+	ActivatedAt string `json:"activatedAt,omitempty"`
 }
 
 // ConsumeRecord 核销记录
 type ConsumeRecord struct {
-	ID              string `json:"id"`
-	EntitlementID   string `json:"entitlementId"`
-	RequestID       string `json:"requestId"`
-	ModelID         string `json:"modelId,omitempty"`
-	TokensConsumed  int64  `json:"tokensConsumed"`
-	Status          string `json:"status"`
-	CreatedAt       string `json:"createdAt"`
+	ID             string `json:"id"`
+	EntitlementID  string `json:"entitlementId"`
+	RequestID      string `json:"requestId"`
+	ModelID        string `json:"modelId,omitempty"`
+	TokensConsumed int64  `json:"tokensConsumed"`
+	Status         string `json:"status"`
+	CreatedAt      string `json:"createdAt"`
+	// V32 缓存/预留/调用计数列 (ConsumeRecordDO), 旧表未迁移时为 0/缺省。
+	ReservedTokens   int64 `json:"reservedTokens,omitempty"`
+	CallsConsumed    int   `json:"callsConsumed,omitempty"`
+	InputTokens      int   `json:"inputTokens,omitempty"`
+	OutputTokens     int   `json:"outputTokens,omitempty"`
+	CacheReadTokens  int   `json:"cacheReadTokens,omitempty"`
+	CacheCreateTokens int  `json:"cacheCreateTokens,omitempty"`
 }
 
 // ---------- V29 Per-Model Bucket ----------
@@ -881,41 +904,123 @@ type ConsumeRecordPage struct {
 
 // ---------- Token Packages (商城) ----------
 
-// TokenPackage 流量包商品
+// TokenPackage 流量包商品。
+//
+// 形状严格对齐网关 /token-packages 列表端点 (代理转发 tk-dist /api/products
+// → ConsumerPublicController.toProductView)。字段名 = 后端 Map 键字面量。
+// 价格字段单位为「分」(Cent/Fen), 整型。
 type TokenPackage struct {
-	ID          string      `json:"id"`
-	Name        string      `json:"name"`
-	Description string      `json:"description,omitempty"`
-	TokenQuota  int64       `json:"tokenQuota"`
-	CallQuota   int         `json:"callQuota,omitempty"`
-	Price       json.Number `json:"price"`
-	ValidDays   int         `json:"validDays"`
-	IsEnabled   bool        `json:"isEnabled"`
-	SortOrder   int     `json:"sortOrder,omitempty"`
+	ID                string      `json:"id"`
+	Name              string      `json:"name"`
+	Description       string      `json:"description,omitempty"`
+	OriginalPriceCent int64       `json:"originalPriceCent"`
+	CampaignPriceCent int64       `json:"campaignPriceCent"`
+	RenewalPriceCent  int64       `json:"renewalPriceCent"`
+	// 折扣率 0~1 (BigDecimal, JSON 数字); 0 表示无折扣
+	DiscountRate json.Number `json:"discountRate"`
+	ModelsJSON   string      `json:"modelsJson,omitempty"`
+	ProductImage string      `json:"productImage,omitempty"`
+	Features     []string    `json:"features,omitempty"`
+	BillingCycle string      `json:"billingCycle"`
+	Featured     bool        `json:"featured"`
+	Eyebrow      string      `json:"eyebrow,omitempty"`
+	Promo        string      `json:"promo,omitempty"`
+	Usage        string      `json:"usage,omitempty"`
+	SortOrder    int         `json:"sortOrder,omitempty"`
 }
 
-// Order 订单
-type Order struct {
-	ID          string      `json:"id"`
-	PackageID   string      `json:"packageId"`
-	PackageName string      `json:"packageName,omitempty"`
-	Amount      json.Number `json:"amount"`
-	Status      string      `json:"status"`
-	PayURL      string      `json:"payUrl,omitempty"`
-	CreatedAt   string      `json:"createdAt"`
+// BankTransferInfo 对公转账信息 (BANK_TRANSFER 下单时 BuyResponse 携带)。
+// 形状对齐 tk-dist PaymentConfigService.BankTransferInfo。
+type BankTransferInfo struct {
+	AccountName          string `json:"accountName,omitempty"`
+	BankName             string `json:"bankName,omitempty"`
+	BankBranch           string `json:"bankBranch,omitempty"`
+	AccountNo            string `json:"accountNo,omitempty"`
+	QRCodeURL            string `json:"qrCodeUrl,omitempty"`
+	Instructions         string `json:"instructions,omitempty"`
+	RemarkHint           string `json:"remarkHint,omitempty"`
+	SalesConsultantQRURL string `json:"salesConsultantQrUrl,omitempty"`
 }
 
-// OrderStatus 订单状态
-type OrderStatus struct {
-	OrderID string `json:"orderId"`
-	Status  string `json:"status"`
+// BuyResponse 下单 / 订单状态响应。
+//
+// 形状严格对齐 tk-dist OrderPaymentService.BuyResponse (网关纯透传):
+// 购买 (BuyTokenPackage) 与状态查询 (GetOrderStatus) 共用此结构。
+//
+// 状态双字段:
+//   - OrderStatus  订单状态 (PENDING / PAID / EXPIRED / REFUNDING / REFUNDED ...)
+//   - PaymentStatus 支付状态 (CREATED / NOTPAY / SUCCESS / AWAITING_REMITTANCE / REFUNDED ...)
+//
+// 终态判定优先用 PaymentStatus (回退 OrderStatus), 见 isOrderTerminal。
+type BuyResponse struct {
+	OrderID          int64             `json:"orderId"`
+	OrderNo          string            `json:"orderNo"`
+	ProductID        string            `json:"productId,omitempty"`
+	ProductName      string            `json:"productName,omitempty"`
+	AmountFen        int64             `json:"amountFen"`
+	OrderStatus      string            `json:"orderStatus"`
+	PaymentMethod    string            `json:"paymentMethod"`
+	PaymentStatus    string            `json:"paymentStatus"`
+	QRCodeContent    string            `json:"qrCodeContent,omitempty"`
+	PayURL           string            `json:"payUrl,omitempty"`
+	PaymentExpiresAt string            `json:"paymentExpiresAt,omitempty"`
+	BankTransferInfo *BankTransferInfo `json:"bankTransferInfo,omitempty"`
 }
 
-// [RC-12] OrderPage 已移除: 死代码, ListMyOrders 使用 []Order 直接返回
+// OrderListItem 我的订单列表行。
+//
+// 形状严格对齐网关 /token-packages/my (代理转发 tk-dist /api/nexus-proxy/orders
+// → NexusProxyController.toOrderMap)。注意金额字段名为 amountCent, 状态字段名为
+// payStatus, 与 BuyResponse 完全不同 (这是后端的第三套形状)。
+type OrderListItem struct {
+	ID                string `json:"id"`
+	BizOrderID        string `json:"bizOrderId,omitempty"`
+	ProductName       string `json:"productName,omitempty"`
+	AmountCent        int64  `json:"amountCent"`
+	OriginalPriceCent int64  `json:"originalPriceCent,omitempty"`
+	DiscountRate      string `json:"discountRate,omitempty"`
+	PaymentMethod     string `json:"paymentMethod,omitempty"`
+	PayStatus         string `json:"payStatus"`
+	CommissionStatus  string `json:"commissionStatus,omitempty"`
+	IssueStatus       string `json:"issueStatus,omitempty"`
+	ChannelCode       string `json:"channelCode,omitempty"`
+	CreatedAt         string `json:"createdAt,omitempty"`
+	PayTime           string `json:"payTime,omitempty"`
+}
 
-// PayPayload 下单请求
+// Order 订单。
+//
+// Deprecated: 旧形状 (id/packageId/amount/status/payUrl) 与任何真实端点都不符。
+// 购买与订单状态查询请改用 BuyResponse; 列表请用 OrderListItem。别名保留仅为避免
+// 破坏下游编译, 将在下个大版本移除。
+type Order = BuyResponse
+
+// OrderStatus 订单状态。
+//
+// Deprecated: GetOrderStatus 现返回 BuyResponse (真实响应无 status 字段, 用
+// paymentStatus / orderStatus)。别名保留仅为向后兼容, 将在下个大版本移除。
+type OrderStatus = BuyResponse
+
+// [RC-12] OrderPage 已移除: 死代码, ListMyOrders 使用 []OrderListItem 直接返回
+
+// PayMethod 支付方式枚举字面量 (来自 /payment-options)。
+type PayMethod string
+
+const (
+	PayMethodWechatNative   PayMethod = "WECHAT_NATIVE"
+	PayMethodAlipayPrecreate PayMethod = "ALIPAY_PRECREATE"
+	PayMethodBankTransfer   PayMethod = "BANK_TRANSFER"
+)
+
+// PayPayload 下单请求。
+//
+// 字段名必须为 paymentMethod (后端 OrderPaymentService.BuyRequest.paymentMethod);
+// 旧版误用 payMethod 导致后端收不到支付方式。
 type PayPayload struct {
-	PayMethod string `json:"payMethod,omitempty"`
+	PaymentMethod PayMethod `json:"paymentMethod,omitempty"`
+	DeviceID      string    `json:"deviceId,omitempty"`
+	// 幂等请求 ID
+	ClientRequestID string `json:"clientRequestId,omitempty"`
 }
 
 // ---------- Wallet (钱包) ----------
