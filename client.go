@@ -705,6 +705,15 @@ func (c *Client) GenerateImage(ctx context.Context, modelID string, req *ImageGe
 //
 // 用 PollVideoTask 轮询直到 Status=completed。
 func (c *Client) GenerateVideo(ctx context.Context, modelID string, req *VideoGenerationRequest) (*VideoTaskResponse, error) {
+	// 生成端点: 上游排队 + 提交任务返回 task_id 本身就可能超过 30s。此前这里一个
+	// deadline 都不设, 于是落回 doJSONFullInternal 的控制面默认值 30s —— 与直接兄弟
+	// GenerateImage 不一致。同一处错误在 TS (generateVideo 漏传第 5 实参) 与 Rust
+	// (generate_video 传 DEFAULT_JSON_TIMEOUT_MS) 两个兄弟 SDK 上同时存在。
+	if _, hasDeadline := ctx.Deadline(); !hasDeadline {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, chatRequestTimeout)
+		defer cancel()
+	}
 	endpoint := "/managed-models/" + url.PathEscape(modelID) + "/videos/generations"
 	var env APIResponse[VideoTaskResponse]
 	if _, err := c.doJSONFull(ctx, http.MethodPost, endpoint, req, &env); err != nil {
@@ -1841,7 +1850,18 @@ func (c *Client) GetCertificationStatus(ctx context.Context, skillID string) (*C
 // ============================================================================
 
 // GenerateSkill 根据自然语言描述生成技能定义 (基于独立 LLM)
+//
+// 预算取 chatRequestTimeout: 服务端技能生产器用的是 120s 的 LLM 客户端
+// (internal/service/skill/generator.go 的 http.Client{Timeout: 120s}), 而本方法此前
+// 落回 doJSONFullInternal 的控制面默认值 30s —— 内外预算倒挂, 服务端还没答完客户端
+// 就先断了。客户端预算必须是不需要跟着服务端配置走的上界, 故复用生成类预算而不是
+// 硬编码 180s 去贴那个可被运维调整的 120s。
 func (c *Client) GenerateSkill(ctx context.Context, req GenerateSkillRequest) (*GenerateSkillResult, error) {
+	if _, hasDeadline := ctx.Deadline(); !hasDeadline {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, chatRequestTimeout)
+		defer cancel()
+	}
 	var resp APIResponse[GenerateSkillResult]
 	if err := c.doJSON(ctx, http.MethodPost, "/skill-generator/generate", req, &resp, false); err != nil {
 		return nil, err
@@ -1849,8 +1869,13 @@ func (c *Client) GenerateSkill(ctx context.Context, req GenerateSkillRequest) (*
 	return &resp.Data, nil
 }
 
-// OptimizeSkill 优化已有技能定义
+// OptimizeSkill 优化已有技能定义 (基于独立 LLM, 预算同 GenerateSkill)
 func (c *Client) OptimizeSkill(ctx context.Context, req OptimizeSkillRequest) (*OptimizeSkillResult, error) {
+	if _, hasDeadline := ctx.Deadline(); !hasDeadline {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, chatRequestTimeout)
+		defer cancel()
+	}
 	var resp APIResponse[OptimizeSkillResult]
 	if err := c.doJSON(ctx, http.MethodPost, "/skill-generator/optimize", req, &resp, false); err != nil {
 		return nil, err
@@ -1858,8 +1883,13 @@ func (c *Client) OptimizeSkill(ctx context.Context, req OptimizeSkillRequest) (*
 	return &resp.Data, nil
 }
 
-// ValidateSkill 校验技能定义正确性
+// ValidateSkill 校验技能定义正确性 (同样经服务端 LLM, 预算同 GenerateSkill)
 func (c *Client) ValidateSkill(ctx context.Context, skillName string) error {
+	if _, hasDeadline := ctx.Deadline(); !hasDeadline {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, chatRequestTimeout)
+		defer cancel()
+	}
 	body := map[string]string{"skillName": skillName}
 	return c.doJSON(ctx, http.MethodPost, "/skill-generator/validate", body, nil, false)
 }
