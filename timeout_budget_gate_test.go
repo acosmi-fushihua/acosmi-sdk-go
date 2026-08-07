@@ -17,6 +17,7 @@ package acosmi
 // 某人当时的命名。新增端点忘了声明预算会当场红，而不是等用户在 30 秒上撞墙。
 
 import (
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -127,28 +128,40 @@ func auditSource(src, origin string) (int, []string) {
 }
 
 func TestEveryInferenceEndpointDeclaresABudget(t *testing.T) {
-	entries, err := os.ReadDir(".")
-	if err != nil {
-		t.Fatalf("读取包目录: %v", err)
-	}
+	// 递归扫全模块而不是只扫包根：本 SDK 现在是扁平的（端点全在根包的 client.go），
+	// 只扫根目录**今天**没有盲区 —— 但那样一来，把端点挪进一个子包就能悄悄绕开闸门。
+	// 一个有盲区的闸门会给出「已覆盖」的错觉，比没有闸门更糟。
 	total := 0
 	var bad []string
 	files := 0
-	for _, e := range entries {
-		name := e.Name()
-		if e.IsDir() || filepath.Ext(name) != ".go" || strings.HasSuffix(name, "_test.go") {
-			continue
-		}
-		src, err := os.ReadFile(name)
+	err := filepath.WalkDir(".", func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
-			t.Fatalf("读取 %s: %v", name, err)
+			return err
+		}
+		if d.IsDir() {
+			// 构建产物与依赖目录不是本仓源码。
+			if d.Name() == "vendor" || d.Name() == "testdata" || strings.HasPrefix(d.Name(), ".") && d.Name() != "." {
+				return fs.SkipDir
+			}
+			return nil
+		}
+		if filepath.Ext(path) != ".go" || strings.HasSuffix(path, "_test.go") {
+			return nil
+		}
+		src, readErr := os.ReadFile(path)
+		if readErr != nil {
+			return readErr
 		}
 		files++
-		seen, v := auditSource(string(src), name)
+		seen, v := auditSource(string(src), filepath.ToSlash(path))
 		total += seen
 		bad = append(bad, v...)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("遍历源码: %v", err)
 	}
-	if files < 5 {
+	if files < 20 {
 		t.Fatalf("只扫到 %d 个生产源文件，疑似扫描器失效", files)
 	}
 	if len(bad) > 0 {
