@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -143,6 +144,16 @@ func codeChallenge(verifier string) string {
 	return base64.RawURLEncoding.EncodeToString(h[:])
 }
 
+// generateState 生成 OAuth `state` 参数 (32 字节随机 → base64url 无填充)。
+// 与 TS generateState / Rust generate_state 同一随机源与编码。
+func generateState() (string, error) {
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return base64.RawURLEncoding.EncodeToString(b), nil
+}
+
 // ---------- LoginWithHandler 事件模型 ----------
 
 // LoginEventType 登录事件类型
@@ -168,6 +179,9 @@ const (
 	ErrTimeout       LoginErrCode = "auth_timeout"
 	ErrTokenExchange LoginErrCode = "token_exchange_failed"
 	ErrSSLProxy      LoginErrCode = "ssl_proxy_detected"
+	// ErrStateMismatch 回调 state 与发起时不一致 (CSRF 防护)。与 TS ErrStateMismatch /
+	// Rust ERR_STATE_MISMATCH 字面量一致 —— 上层按该码统一提示"请重新发起登录"。
+	ErrStateMismatch LoginErrCode = "state_mismatch"
 )
 
 // LoginEvent 登录流程事件
@@ -261,6 +275,18 @@ func authorizeInternal(ctx context.Context, meta *ServerMetadata, clientID strin
 	}
 	challenge := codeChallenge(verifier)
 
+	// [2026-08-14] 桌面 loopback 也发送并校验 state。
+	//
+	// 此前三套 SDK 的桌面流一律不带 state, 理由是"本地回环天然防 CSRF"。这个理由并不成立:
+	// 回环监听在整个流程期间对**本机任意进程**开放, 一个本地恶意进程只要往
+	// http://127.0.0.1:<port>/callback?code=<攻击者的授权码> 打一枪, SDK 就会拿别人的
+	// 授权码去换 token, 把用户的会话接到攻击者账号上 (经典 login-CSRF)。端口是随机的,
+	// 但可枚举 —— 猜中 1/64512 的成本对本地进程可以忽略。state 让这枪必须先猜中 32 字节随机数。
+	state, err := generateState()
+	if err != nil {
+		return nil, "", fmt.Errorf("generate state: %w", err)
+	}
+
 	// 启动本地 callback server
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -275,6 +301,18 @@ func authorizeInternal(ctx context.Context, meta *ServerMetadata, clientID strin
 	mux := http.NewServeMux()
 	mux.HandleFunc("/callback", func(w http.ResponseWriter, r *http.Request) {
 		code := r.URL.Query().Get("code")
+		// state 校验必须在消费 code **之前**: 一旦把 code 送进 codeCh, 后续就会拿它去换 token。
+		// 用 subtle.ConstantTimeCompare 而非 != , 避免按字节比较的时序侧信道 (本地攻击者可反复试探)。
+		if got := r.URL.Query().Get("state"); code != "" &&
+			subtle.ConstantTimeCompare([]byte(got), []byte(state)) != 1 {
+			errCh <- fmt.Errorf("%s: callback state does not match pending state (possible CSRF)", string(ErrStateMismatch))
+			fmt.Fprint(w, `<!DOCTYPE html><html><head><meta charset="utf-8"><title>授权失败</title></head>`+
+				`<body style="font-family:system-ui,sans-serif;text-align:center;padding:60px 20px">`+
+				`<h2>授权失败</h2><p>回调校验未通过，已中止登录。</p>`+
+				`<p style="color:#888;font-size:14px">可以关闭此窗口。</p>`+
+				`</body></html>`)
+			return
+		}
 		if code == "" {
 			errMsg := r.URL.Query().Get("error_description")
 			if errMsg == "" {
@@ -318,6 +356,7 @@ func authorizeInternal(ctx context.Context, meta *ServerMetadata, clientID strin
 	q.Set("response_type", "code")
 	q.Set("code_challenge", challenge)
 	q.Set("code_challenge_method", "S256")
+	q.Set("state", state)
 	if len(scopes) > 0 {
 		q.Set("scope", strings.Join(scopes, " "))
 	}
@@ -355,7 +394,9 @@ func authorizeInternal(ctx context.Context, meta *ServerMetadata, clientID strin
 		return &AuthorizeResult{Code: code, RedirectURI: redirectURI}, verifier, nil
 	case authErr := <-errCh:
 		// 所有 errCh 错误均 emit 事件
-		if strings.Contains(authErr.Error(), "denied") {
+		if strings.Contains(authErr.Error(), string(ErrStateMismatch)) {
+			emit(LoginEvent{Type: EventError, ErrCode: ErrStateMismatch, Error: authErr.Error()})
+		} else if strings.Contains(authErr.Error(), "denied") {
 			emit(LoginEvent{Type: EventError, ErrCode: ErrAuthDenied, Error: authErr.Error()})
 		} else {
 			emit(LoginEvent{Type: EventError, ErrCode: ErrTokenExchange, Error: authErr.Error()})
