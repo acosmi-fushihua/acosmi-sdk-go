@@ -134,6 +134,12 @@ var agentAddCmd = &cobra.Command{
 			Models: []string{modelID},
 		})
 		if err != nil {
+			// 首次使用最常见的失败: 之前用别的命令登录过, 但那次没申请 agent_access:manage
+			// (它不在 AllScopes 里, 必须显式申请)。直接把补救命令给出来, 别让用户去猜。
+			if isScopeRelatedError(err) {
+				return fmt.Errorf("签发凭证失败: %w\n\n很可能是当前登录态缺少签发权限。请重新授权:\n"+
+					"    acosmi auth login --force --scope ai,agent_access:manage", err)
+			}
 			return fmt.Errorf("签发凭证失败: %w", err)
 		}
 		fmt.Printf("已签发: %s (有效期至 %s)\n", created.Key.KeyPrefix, formatExpiry(created.Key.ExpiresAt))
@@ -408,6 +414,24 @@ var agentRemoveCmd = &cobra.Command{
 		}
 		return nil
 	},
+}
+
+// isScopeRelatedError 粗筛"权限不足"类错误。
+//
+// 服务端在这条路上有三种可能的拒绝: insufficient_scope (token 没有 agent_access:manage)、
+// issuer_not_consented (凭证类型不被接受)、以及签发交集校验失败。三者的补救动作是同一个:
+// 带上正确的 scope 重新授权。故按关键字粗筛即可 —— 猜错的代价只是多给一条无害的提示。
+func isScopeRelatedError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	for _, kw := range []string{"scope", "403", "forbidden", "授权", "权限", "consent"} {
+		if strings.Contains(msg, kw) {
+			return true
+		}
+	}
+	return false
 }
 
 // dottedExists 判断点分路径在配置里是否还存在 (doctor 用)。
