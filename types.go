@@ -17,6 +17,11 @@ type ServerMetadata struct {
 	RevocationEndpoint    string   `json:"revocation_endpoint"`
 	RegistrationEndpoint  string   `json:"registration_endpoint"`
 	ScopesSupported       []string `json:"scopes_supported"`
+	// GrantTypesSupported AS 实际支持的 grant_type 集 (RFC 8414)。
+	GrantTypesSupported []string `json:"grant_types_supported,omitempty"`
+	// DeviceAuthorizationEndpoint RFC 8628 设备授权端点; 空 = 服务端未开放设备流。
+	// 不猜路径 —— 猜出来的 404 只会让错误更难懂 (见 DeviceAuthorizationEndpoint)。
+	DeviceAuthorizationEndpoint string `json:"device_authorization_endpoint,omitempty"`
 }
 
 // TokenResponse OAuth token 响应
