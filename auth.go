@@ -298,14 +298,34 @@ func authorizeInternal(ctx context.Context, meta *ServerMetadata, clientID strin
 	codeCh := make(chan string, 1)
 	errCh := make(chan error, 1)
 
+	// 结算只取首发: codeCh/errCh 缓冲为 1 且只被 select 消费一次, 后续回调的 send 一律
+	// 非阻塞丢弃 — 否则第 ≥3 发恶意回调会把 handler goroutine 卡死在阻塞 send 上,
+	// defer 的 server.Shutdown 等待活跃连接进而永久悬挂。
+	settleErr := func(err error) {
+		select {
+		case errCh <- err:
+		default:
+		}
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/callback", func(w http.ResponseWriter, r *http.Request) {
-		code := r.URL.Query().Get("code")
-		// state 校验必须在消费 code **之前**: 一旦把 code 送进 codeCh, 后续就会拿它去换 token。
-		// 用 subtle.ConstantTimeCompare 而非 != , 避免按字节比较的时序侧信道 (本地攻击者可反复试探)。
-		if got := r.URL.Query().Get("state"); code != "" &&
-			subtle.ConstantTimeCompare([]byte(got), []byte(state)) != 1 {
-			errCh <- fmt.Errorf("%s: callback state does not match pending state (possible CSRF)", string(ErrStateMismatch))
+		// state 校验对 /callback 的**每一种**形态先行 —— 成功回调、OAuth error 回调、畸形回调
+		// 一视同仁, 且必须在消费 code / 结算 denied **之前**。否则本机任意进程不猜 state 也能
+		// 伪造一发 ?error=access_denied 把等待中的登录打成"用户已拒绝" (login-DoS / 状态注入)。
+		// "恰好一个": 重复 state 参数不允许蒙混; 缺失与错值同罪。错误信息只描述形态,
+		// 不回显任何回调取值。比较用 subtle.ConstantTimeCompare, 避免时序侧信道。
+		states := r.URL.Query()["state"]
+		stateFailure := ""
+		switch {
+		case len(states) == 0:
+			stateFailure = "callback missing state"
+		case len(states) > 1:
+			stateFailure = "callback carried multiple state values"
+		case subtle.ConstantTimeCompare([]byte(states[0]), []byte(state)) != 1:
+			stateFailure = "callback state does not match pending state"
+		}
+		if stateFailure != "" {
+			settleErr(fmt.Errorf("%s: %s (possible CSRF)", string(ErrStateMismatch), stateFailure))
 			fmt.Fprint(w, `<!DOCTYPE html><html><head><meta charset="utf-8"><title>授权失败</title></head>`+
 				`<body style="font-family:system-ui,sans-serif;text-align:center;padding:60px 20px">`+
 				`<h2>授权失败</h2><p>回调校验未通过，已中止登录。</p>`+
@@ -313,12 +333,13 @@ func authorizeInternal(ctx context.Context, meta *ServerMetadata, clientID strin
 				`</body></html>`)
 			return
 		}
+		code := r.URL.Query().Get("code")
 		if code == "" {
 			errMsg := r.URL.Query().Get("error_description")
 			if errMsg == "" {
 				errMsg = r.URL.Query().Get("error")
 			}
-			errCh <- fmt.Errorf("authorization denied: %s", errMsg)
+			settleErr(fmt.Errorf("authorization denied: %s", errMsg))
 			// 根因修复 #8: XSS — 使用 html.EscapeString 转义用户输入
 			fmt.Fprintf(w, `<!DOCTYPE html><html><head><meta charset="utf-8"><title>授权失败</title></head>`+
 				`<body style="font-family:system-ui,sans-serif;text-align:center;padding:60px 20px">`+
@@ -327,7 +348,10 @@ func authorizeInternal(ctx context.Context, meta *ServerMetadata, clientID strin
 				`</body></html>`, html.EscapeString(errMsg))
 			return
 		}
-		codeCh <- code
+		select {
+		case codeCh <- code:
+		default:
+		}
 		fmt.Fprint(w, `<!DOCTYPE html><html><head><meta charset="utf-8"><title>授权成功</title></head>`+
 			`<body style="font-family:system-ui,sans-serif;text-align:center;padding:60px 20px">`+
 			`<h2>授权成功</h2>`+
@@ -340,7 +364,7 @@ func authorizeInternal(ctx context.Context, meta *ServerMetadata, clientID strin
 	server := &http.Server{Handler: mux}
 	go func() {
 		if srvErr := server.Serve(listener); srvErr != http.ErrServerClosed {
-			errCh <- srvErr
+			settleErr(srvErr)
 		}
 	}()
 	defer server.Shutdown(context.Background())
